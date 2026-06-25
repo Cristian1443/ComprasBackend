@@ -13,7 +13,7 @@ const pool = new Pool({
 
 async function runMigration() {
     try {
-        const sqlPath = path.join(__dirname, '..', 'database', '12_audit_inserts.sql');
+        const sqlPath = path.join(__dirname, '..', 'database', 'migrations', '12_audit_inserts.sql');
         const sql = fs.readFileSync(sqlPath, 'utf8');
 
         console.log('Ejecutando migración 12_audit_inserts.sql...');

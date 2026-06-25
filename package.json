@@ -1,0 +1,30 @@
+{
+  "name": "compras-contratacion-backend",
+  "version": "1.0.0",
+  "description": "Portal de Compras y Contratación – Invest in Bogotá (API Express/PostgreSQL)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "db:migrate": "node scripts/run-migration.cjs",
+    "db:seed": "node scripts/seed_users.js",
+    "db:check": "node scripts/check_schema.js"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^5.1.1",
+    "axios": "^1.16.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "form-data": "^4.0.5",
+    "multer": "^2.1.1",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^8.0.3",
+    "pdfkit": "^0.18.0",
+    "pg": "^8.11.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

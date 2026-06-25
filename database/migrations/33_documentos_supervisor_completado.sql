@@ -1,0 +1,2 @@
+ALTER TABLE documentos_supervisor
+    ADD COLUMN IF NOT EXISTS completado BOOLEAN NOT NULL DEFAULT FALSE;

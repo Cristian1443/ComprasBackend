@@ -1,0 +1,31 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno (nunca al repo)
+.env
+.env.local
+.env.*.local
+
+# Archivos subidos por usuarios
+uploads/convocatorias/*
+uploads/solicitudes/*
+uploads/juridica/*
+uploads/facturas/*
+uploads/firmas/*
+uploads/actas/*
+!uploads/**/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/

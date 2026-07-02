@@ -5638,6 +5638,63 @@ app.put('/api/convocatorias/:id/link-publico', async (req, res) => {
     }
 })();
 
+// ─── Migración: columnas restantes (proponentes, auditoria, tablas supervisión) ──
+(async () => {
+    try {
+        // solicitudes: fechas de envío
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS fecha_envio_financiera TIMESTAMPTZ`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS fecha_envio_juridica TIMESTAMPTZ`);
+
+        // proponentes: campos de cotización
+        await pool.query(`ALTER TABLE proponentes ADD COLUMN IF NOT EXISTS valor_cotizacion NUMERIC(18,2)`);
+        await pool.query(`ALTER TABLE proponentes ADD COLUMN IF NOT EXISTS plazo_meses INTEGER`);
+        await pool.query(`ALTER TABLE proponentes ADD COLUMN IF NOT EXISTS plazo_dias INTEGER`);
+        await pool.query(`ALTER TABLE proponentes ADD COLUMN IF NOT EXISTS actualizado_en TIMESTAMPTZ DEFAULT NOW()`);
+
+        // facturas_contrato: nombre de adjunto
+        await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS adjunto_nombre TEXT`);
+
+        // auditoria: campos extendidos
+        await pool.query(`ALTER TABLE auditoria ADD COLUMN IF NOT EXISTS tipo_log VARCHAR(50) DEFAULT 'negocio'`);
+        await pool.query(`ALTER TABLE auditoria ADD COLUMN IF NOT EXISTS modulo VARCHAR(100)`);
+        await pool.query(`ALTER TABLE auditoria ADD COLUMN IF NOT EXISTS descripcion TEXT`);
+        await pool.query(`ALTER TABLE auditoria ADD COLUMN IF NOT EXISTS rol_usuario VARCHAR(100)`);
+        await pool.query(`ALTER TABLE auditoria ADD COLUMN IF NOT EXISTS resultado VARCHAR(50) DEFAULT 'exitoso'`);
+
+        // Tabla entregables_supervisor
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS entregables_supervisor (
+                id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                solicitud_id     UUID NOT NULL REFERENCES solicitudes(id) ON DELETE CASCADE,
+                nombre           TEXT NOT NULL,
+                orden            INTEGER NOT NULL DEFAULT 0,
+                completado       BOOLEAN NOT NULL DEFAULT FALSE,
+                fecha_completado TIMESTAMPTZ,
+                creado_en        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_entregables_supervisor_solicitud ON entregables_supervisor(solicitud_id)`);
+
+        // Tabla informes_supervision_contrato
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS informes_supervision_contrato (
+                id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                solicitud_id     UUID NOT NULL REFERENCES solicitudes(id) ON DELETE CASCADE,
+                numero           INTEGER NOT NULL,
+                completado       BOOLEAN NOT NULL DEFAULT FALSE,
+                observaciones    TEXT,
+                fecha_completado TIMESTAMPTZ,
+                creado_en        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_informes_supervision_solicitud ON informes_supervision_contrato(solicitud_id)`);
+
+        console.log('✓ Columnas proponentes/auditoria y tablas supervisión verificadas');
+    } catch (e) {
+        console.error('Advertencia al verificar columnas restantes:', e.message);
+    }
+})();
+
 // GET /api/financiera/facturas-aprobadas — facturas aprobadas por supervisor y gerente, pendientes de confirmación de pago
 app.get('/api/financiera/facturas-aprobadas', async (_req, res) => {
     try {

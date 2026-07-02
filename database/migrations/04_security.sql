@@ -8,7 +8,7 @@
 -- ============================================================
 
 -- Rol de solo lectura (reportes, BI)
-CREATE ROLE compras_readonly;
+DO $$ BEGIN CREATE ROLE compras_readonly; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 GRANT CONNECT ON DATABASE compras_db TO compras_readonly;
 GRANT USAGE ON SCHEMA public TO compras_readonly;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO compras_readonly;
@@ -17,7 +17,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT ON TABLES TO compras_readonly;
 
 -- Rol de la aplicación (API backend)
-CREATE ROLE compras_app;
+DO $$ BEGIN CREATE ROLE compras_app; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 GRANT CONNECT ON DATABASE compras_db TO compras_app;
 GRANT USAGE ON SCHEMA public TO compras_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO compras_app;
@@ -26,7 +26,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO compras_app;
 
 -- Rol de administrador de datos (sin acceso a DROP/ALTER)
-CREATE ROLE compras_admin;
+DO $$ BEGIN CREATE ROLE compras_admin; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 GRANT compras_app TO compras_admin;
 GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA public TO compras_admin;
 

@@ -17,7 +17,8 @@ CREATE TYPE rol_usuario AS ENUM (
     'gerente_area',
     'supervisor',       -- Solicitante
     'juridica',
-    'financiera'
+    'financiera',
+    'secretaria_comite'     
 );
 
 CREATE TYPE estado_solicitud AS ENUM (
@@ -110,6 +111,8 @@ CREATE TABLE solicitudes (
     objeto              TEXT,               -- Descripción corta/titulo
     lugar_ejecucion     VARCHAR(200),
     plazo_ejecucion_meses INTEGER,          -- Tiempo en meses calendario
+    plazo_desde         DATE,               -- Fecha inicio de ejecución
+    plazo_hasta         DATE,               -- Fecha fin de ejecución
 
     -- Sección III: Modalidad y Valor (Solicitante llena)
     modalidad           modalidad_contrato,

@@ -102,7 +102,8 @@ const allowedOrigins = [
     'http://localhost:5173',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:5173',
-];
+    process.env.FRONTEND_URL,
+].filter(Boolean);
 app.use(cors({
     origin: (origin, callback) => {
         // Permitir sin origen (ej. curl, Postman, proxy interno de Vite)
@@ -150,7 +151,7 @@ app.post('/api/solicitudes/upload', (req, res, next) => {
 
 // POST /api/solicitudes/:id/anexos — sube un archivo y lo agrega al JSON de anexos de la solicitud
 app.post('/api/solicitudes/:id/anexos', (req, res, next) => {
-    uploadSolicitudes.single('file')(req, res, function(err) {
+    uploadSolicitudes.single('file')(req, res, function (err) {
         if (err instanceof multer.MulterError) return res.status(400).json({ error: err.message });
         if (err) return res.status(400).json({ error: err.message });
         next();
@@ -267,8 +268,8 @@ async function registrarLog({ tipo_log = 'negocio', modulo, tabla, registro_id, 
                  valor_anterior, valor_nuevo, descripcion, usuario_id, rol_usuario, ip_address, resultado)
              VALUES ($1,$2,$3,$4::uuid,$5,$6,$7,$8,$9,$10,$11,$12::inet,$13)`,
             [tipo_log, modulo, tabla, registro_id, accion,
-             campo, valor_anterior, valor_nuevo, descripcion,
-             usuario_id || null, rol_usuario || null, ip_address || null, resultado]
+                campo, valor_anterior, valor_nuevo, descripcion,
+                usuario_id || null, rol_usuario || null, ip_address || null, resultado]
         );
     } catch (e) {
         console.error('[audit] Error registrando log:', e.message);
@@ -484,6 +485,14 @@ app.get('/api/solicitudes/:id', async (req, res) => {
         );
         if (fullResult.rows.length > 0) {
             Object.assign(solicitud, fullResult.rows[0]);
+        }
+
+        // Parsear campos TEXT que se guardan como JSON stringificado
+        const jsonTextFields = ['entregables_detalle', 'obligaciones_especificas', 'anexos_solicitante'];
+        for (const field of jsonTextFields) {
+            if (solicitud[field] && typeof solicitud[field] === 'string') {
+                try { solicitud[field] = JSON.parse(solicitud[field]); } catch { solicitud[field] = []; }
+            }
         }
 
         // 2. Datos de modalidad
@@ -723,7 +732,7 @@ app.post('/api/solicitudes', async (req, res) => {
                         p.correo || null,
                         p.valorCotizacion || p.valor_cotizacion || null,
                         p.plazoMeses ? Number(p.plazoMeses) : (p.plazo_meses ? Number(p.plazo_meses) : null),
-                        p.plazoDias  ? Number(p.plazoDias)  : (p.plazo_dias  ? Number(p.plazo_dias)  : null),
+                        p.plazoDias ? Number(p.plazoDias) : (p.plazo_dias ? Number(p.plazo_dias) : null),
                     ]
                 );
             }
@@ -924,7 +933,7 @@ app.put('/api/solicitudes/:id', async (req, res) => {
                         p.correo || null,
                         p.valorCotizacion || p.valor_cotizacion || null,
                         p.plazoMeses ? Number(p.plazoMeses) : (p.plazo_meses ? Number(p.plazo_meses) : null),
-                        p.plazoDias  ? Number(p.plazoDias)  : (p.plazo_dias  ? Number(p.plazo_dias)  : null),
+                        p.plazoDias ? Number(p.plazoDias) : (p.plazo_dias ? Number(p.plazo_dias) : null),
                     ]
                 );
             }
@@ -995,7 +1004,7 @@ app.get('/api/supervisor/contratos', async (req, res) => {
         const userId = userRes.rows[0].id;
 
         const result = await pool.query(
-            `SELECT s.id, s.codigo, s.objeto, s.estado, s.moneda, s.valor_en_cop, s.valor_estimado,
+            `SELECT s.id, s.codigo, s.objeto, s.titulo_contrato, s.estado, s.moneda, s.valor_en_cop, s.valor_estimado,
                     s.valor_moneda_cop_texto, s.valor_moneda_usd_texto, s.valor_moneda_eur_texto,
                     s.plazo_ejecucion_meses, s.plazo_ejecucion_dias, s.creado_en,
                     u_sol.nombre AS solicitante_nombre,
@@ -1009,7 +1018,7 @@ app.get('/api/supervisor/contratos', async (req, res) => {
              LEFT JOIN facturas_contrato fc ON fc.solicitud_id = s.id
              WHERE s.supervision_id = $1
                AND s.estado != 'borrador'
-             GROUP BY s.id, s.codigo, s.objeto, s.estado, s.moneda, s.valor_en_cop, s.valor_estimado,
+             GROUP BY s.id, s.codigo, s.objeto, s.titulo_contrato, s.estado, s.moneda, s.valor_en_cop, s.valor_estimado,
                       s.valor_moneda_cop_texto, s.valor_moneda_usd_texto, s.valor_moneda_eur_texto,
                       s.plazo_ejecucion_meses, s.plazo_ejecucion_dias, s.creado_en, u_sol.nombre
              ORDER BY s.actualizado_en DESC`,
@@ -1308,7 +1317,7 @@ app.delete('/api/supervisor/contratos/:id/documentos-lista/:docId', async (req, 
 // Guarda evaluación; si total < 70, bloquea proveedor
 app.post('/api/supervisor/evaluacion', async (req, res) => {
     const { email, solicitud_id, nombre_proveedor, correo_proveedor, criterios, total,
-            observaciones, firma_designado, fecha_evaluacion, proxima_evaluacion, proponente_id } = req.body;
+        observaciones, firma_designado, fecha_evaluacion, proxima_evaluacion, proponente_id } = req.body;
 
     if (!email || !solicitud_id || !nombre_proveedor || total === undefined) {
         return res.status(400).json({ error: 'email, solicitud_id, nombre_proveedor y total son requeridos' });
@@ -1345,8 +1354,8 @@ app.post('/api/supervisor/evaluacion', async (req, res) => {
                proxima_evaluacion = EXCLUDED.proxima_evaluacion
              RETURNING id`,
             [solicitud_id, proponente_id || null, nombre_proveedor, correo_proveedor || null,
-             evaluadorId, criteriosJson, Number(total), observaciones || null, firma_designado || null,
-             fecha_evaluacion || new Date().toISOString().slice(0, 10), proxima_evaluacion || null]
+                evaluadorId, criteriosJson, Number(total), observaciones || null, firma_designado || null,
+                fecha_evaluacion || new Date().toISOString().slice(0, 10), proxima_evaluacion || null]
         );
 
         const evalId = evalRes.rows[0].id;
@@ -1369,6 +1378,187 @@ app.post('/api/supervisor/evaluacion', async (req, res) => {
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al guardar evaluación' });
+    }
+});
+
+// ─── RUTAS PARA SUPERVISOR: Calificación concurrente de proponentes ──
+// Estados en los que Jurídica está activamente calificando y el supervisor
+// designado también debe poder calificar en paralelo.
+const ESTADOS_CALIFICACION_SUPERVISOR = ['en_juridica', 'enviado_juridica'];
+// Solo Invitación y TDR comparan proponentes (igual que esModalidadCalificable en el frontend de Jurídica).
+const MODALIDADES_CALIFICABLES_SUPERVISOR = ['invitacion', 'tdr'];
+
+// GET /api/supervisor/solicitudes-en-calificacion?email=xxx
+// Lista las solicitudes donde el usuario es el supervisor designado (supervision_id)
+// y la solicitud está en etapa de calificación de proponentes.
+app.get('/api/supervisor/solicitudes-en-calificacion', async (req, res) => {
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ error: 'email requerido' });
+    try {
+        const userRes = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email]);
+        if (userRes.rows.length === 0) return res.json([]);
+
+        const result = await pool.query(
+            `SELECT s.id, s.codigo, s.objeto, s.titulo_contrato, s.estado, s.modalidad,
+                    dj.evaluacion_json->'supervisor'->>'finalizada' AS supervisor_finalizada
+             FROM solicitudes s
+             LEFT JOIN solicitudes_detalle_juridico dj ON dj.solicitud_id = s.id
+             WHERE s.supervision_id = $1
+               AND s.estado::text = ANY($2::text[])
+               AND LOWER(s.modalidad::text) = ANY($3::text[])
+             ORDER BY s.actualizado_en DESC`,
+            [userRes.rows[0].id, ESTADOS_CALIFICACION_SUPERVISOR, MODALIDADES_CALIFICABLES_SUPERVISOR]
+        );
+        const lista = result.rows.map(r => ({
+            ...r,
+            supervisor_finalizada: r.supervisor_finalizada === 'true'
+        }));
+        return res.json(lista);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener solicitudes en calificación' });
+    }
+});
+
+// GET /api/supervisor/solicitudes/:id/calificacion?email=xxx
+// Mismo detalle que ve Jurídica, pero solo accesible por el supervisor designado
+// de esa solicitud, y solo mientras está en etapa de calificación.
+app.get('/api/supervisor/solicitudes/:id/calificacion', async (req, res) => {
+    const { id } = req.params;
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ error: 'email requerido' });
+    try {
+        const check = await pool.query(
+            `SELECT s.estado, s.modalidad FROM solicitudes s
+             JOIN usuarios u ON u.id = s.supervision_id
+             WHERE s.id = $1::uuid AND u.email = $2`,
+            [id, email]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'No está designado como supervisor de esta solicitud' });
+        }
+        if (!ESTADOS_CALIFICACION_SUPERVISOR.includes(check.rows[0].estado)) {
+            return res.status(409).json({ error: 'Esta solicitud no está en etapa de calificación de proponentes' });
+        }
+        if (!MODALIDADES_CALIFICABLES_SUPERVISOR.includes(String(check.rows[0].modalidad || '').toLowerCase())) {
+            return res.status(409).json({ error: 'Esta modalidad no requiere calificación de proponentes' });
+        }
+
+        const result = await construirDetalleCalificacion(id);
+        if (result.error) return res.status(result.status || 500).json({ error: result.error });
+        return res.json(result.data);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener calificación del supervisor' });
+    }
+});
+
+// PUT /api/supervisor/solicitudes/:id/calificacion
+// Guarda la calificación propia del supervisor, de forma independiente a la de Jurídica,
+// dentro de evaluacion_json.supervisor (no toca las calificaciones de Jurídica).
+app.put('/api/supervisor/solicitudes/:id/calificacion', async (req, res) => {
+    const { id } = req.params;
+    const {
+        email = null,
+        calificaciones = [],
+        config_puntajes = null,
+        evaluacion_consolidada = '',
+        proponente_recomendado_numero = null,
+        habilitantes_revisados = [],
+        finalizada = false
+    } = req.body || {};
+
+    if (!email) return res.status(400).json({ error: 'email requerido' });
+
+    const numeroRecomendadoRaw = proponente_recomendado_numero != null ? Number(proponente_recomendado_numero) : null;
+    const numeroRecomendado = Number.isFinite(numeroRecomendadoRaw) && numeroRecomendadoRaw > 0
+        ? Math.trunc(numeroRecomendadoRaw)
+        : null;
+
+    const client = await pool.connect();
+    try {
+        await ensureJuridicaDetailStorage();
+        await client.query('BEGIN');
+
+        const check = await client.query(
+            `SELECT s.estado, s.modalidad, u.id as usuario_id FROM solicitudes s
+             JOIN usuarios u ON u.id = s.supervision_id
+             WHERE s.id = $1::uuid AND u.email = $2`,
+            [id, email]
+        );
+        if (check.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'No está designado como supervisor de esta solicitud' });
+        }
+        if (!ESTADOS_CALIFICACION_SUPERVISOR.includes(check.rows[0].estado)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Esta solicitud no está en etapa de calificación de proponentes' });
+        }
+        if (!MODALIDADES_CALIFICABLES_SUPERVISOR.includes(String(check.rows[0].modalidad || '').toLowerCase())) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Esta modalidad no requiere calificación de proponentes' });
+        }
+        const userId = check.rows[0].usuario_id;
+
+        const prevEvRes = await client.query(
+            `SELECT evaluacion_json FROM solicitudes_detalle_juridico WHERE solicitud_id = $1::uuid`,
+            [id]
+        );
+        const prevEv = prevEvRes.rows[0]?.evaluacion_json || {};
+
+        if (prevEv.supervisor?.finalizada === true) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'La calificación del supervisor ya fue finalizada y no puede modificarse.' });
+        }
+
+        const supervisorEval = {
+            calificaciones: Array.isArray(calificaciones) ? calificaciones.map((c) => ({
+                numero: Number.isFinite(Number(c?.numero)) ? Number(c.numero) : null,
+                propuesta_economica: Number(c?.propuesta_economica || 0),
+                experiencia_adicional: Number(c?.experiencia_adicional || 0),
+                experiencia_trabajo: Number(c?.experiencia_trabajo || 0),
+                otros_criterios_puntos: Number(c?.otros_criterios_puntos || 0),
+                total: Number(c?.total || 0)
+            })) : [],
+            config_puntajes: config_puntajes || null,
+            evaluacion_consolidada: String(evaluacion_consolidada || ''),
+            proponente_recomendado_numero: numeroRecomendado,
+            habilitantes_revisados: Array.isArray(habilitantes_revisados) ? habilitantes_revisados.map(Number) : [],
+            finalizada: finalizada === true ? true : (prevEv.supervisor?.finalizada || false),
+            finalizada_en: finalizada === true ? new Date().toISOString() : (prevEv.supervisor?.finalizada_en || null),
+            email,
+            actualizado_en: new Date().toISOString()
+        };
+
+        const evaluacion = { ...prevEv, supervisor: supervisorEval };
+
+        await client.query(
+            `INSERT INTO solicitudes_detalle_juridico (solicitud_id, evaluacion_json, actualizado_en)
+             VALUES ($1::uuid, $2::jsonb, NOW())
+             ON CONFLICT (solicitud_id)
+             DO UPDATE SET evaluacion_json = EXCLUDED.evaluacion_json, actualizado_en = NOW()`,
+            [id, JSON.stringify(evaluacion)]
+        );
+
+        await client.query('COMMIT');
+
+        await registrarLog({
+            tipo_log: 'negocio', modulo: 'supervisor', tabla: 'solicitudes',
+            registro_id: id,
+            accion: finalizada === true ? 'CALIFICACION_SUPERVISOR_FINALIZADA' : 'CALIFICACION_SUPERVISOR_GUARDADA',
+            descripcion: finalizada === true
+                ? 'Calificación del supervisor FINALIZADA (documento bloqueado)'
+                : 'Calificación del supervisor guardada',
+            usuario_id: userId || null
+        });
+
+        return res.json({ ok: true });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        return res.status(500).json({ error: 'Error al guardar calificación del supervisor', detalle: err?.message || null });
+    } finally {
+        client.release();
     }
 });
 
@@ -1577,17 +1767,29 @@ app.get('/api/secretaria/actas/historial', async (_req, res) => {
         let actasFormales = [];
         try {
             const r = await pool.query(
-                `SELECT id::text, acta_numero, fecha_sesion, participantes, solicitudes_ids, decisiones, creado_en
+                `SELECT id::text, acta_numero, fecha_sesion, participantes, solicitudes_ids, decisiones, creado_en,
+                        desarrollo_texto, conclusion_texto, desarrollo_cerrado, conclusion_cerrada,
+                        firmante_directora_nombre, firmante_directora_cargo,
+                        firmante_secretaria_nombre, firmante_secretaria_cargo
                  FROM actas_comite ORDER BY fecha_sesion DESC`
             );
             actasFormales = r.rows.map(a => ({
                 source: 'formal',
+                actaId: a.id,
                 ids: a.solicitudes_ids || [],
                 actaNumero: a.acta_numero || '',
                 fechaSesionISO: a.fecha_sesion,
                 participantes: a.participantes || [],
                 decisiones: a.decisiones || {},
                 savedAt: a.creado_en,
+                desarrolloTexto: a.desarrollo_texto || '',
+                conclusionTexto: a.conclusion_texto || '',
+                desarrolloCerrado: a.desarrollo_cerrado || false,
+                conclusionCerrada: a.conclusion_cerrada || false,
+                firmanteDirectoraNombre: a.firmante_directora_nombre || '',
+                firmanteDirectoraCargo: a.firmante_directora_cargo || '',
+                firmanteSecretariaNombre: a.firmante_secretaria_nombre || '',
+                firmanteSecretariaCargo: a.firmante_secretaria_cargo || '',
             }));
         } catch (_e) { /* tabla aún no creada */ }
 
@@ -1620,8 +1822,8 @@ app.get('/api/secretaria/actas/historial', async (_req, res) => {
                 };
             }
             const decision = row.resultado_comite === 'aprobado' ? 'aprobada'
-                           : row.resultado_comite === 'rechazado' ? 'rechazada'
-                           : 'en_revision';
+                : row.resultado_comite === 'rechazado' ? 'rechazada'
+                    : 'en_revision';
             porFecha[dateKey].ids.push(row.id);
             porFecha[dateKey].decisiones[row.id] = {
                 discusion: row.comentario_comite || '',
@@ -1644,9 +1846,10 @@ app.get('/api/secretaria/actas/historial', async (_req, res) => {
 app.post('/api/secretaria/actas', async (req, res) => {
     try {
         const { acta_numero, fecha_sesion, participantes, solicitudes_ids, decisiones } = req.body;
-        await pool.query(
+        const result = await pool.query(
             `INSERT INTO actas_comite (acta_numero, fecha_sesion, participantes, solicitudes_ids, decisiones)
-             VALUES ($1, $2, $3::jsonb, $4, $5::jsonb)`,
+             VALUES ($1, $2, $3::jsonb, $4, $5::jsonb)
+             RETURNING id::text`,
             [
                 acta_numero || null,
                 fecha_sesion || new Date().toISOString(),
@@ -1655,10 +1858,67 @@ app.post('/api/secretaria/actas', async (req, res) => {
                 JSON.stringify(decisiones || {}),
             ]
         );
-        return res.json({ ok: true });
+        return res.json({ ok: true, id: result.rows[0].id });
     } catch (err) {
         console.error('Error guardando acta:', err);
         return res.status(500).json({ error: 'Error al guardar acta' });
+    }
+});
+
+// PATCH /api/secretaria/actas/:id/textos
+// Guarda desarrollo y/o conclusión del acta y los cierra (no editables después).
+app.patch('/api/secretaria/actas/:id/textos', async (req, res) => {
+    const { id } = req.params;
+    const { desarrollo_texto, conclusion_texto, cerrar_desarrollo, cerrar_conclusion } = req.body;
+    try {
+        const sets = [];
+        const vals = [];
+        let i = 1;
+        if (desarrollo_texto !== undefined) { sets.push(`desarrollo_texto = $${i++}`); vals.push(desarrollo_texto); }
+        if (cerrar_desarrollo) { sets.push(`desarrollo_cerrado = TRUE`); }
+        if (conclusion_texto !== undefined) { sets.push(`conclusion_texto = $${i++}`); vals.push(conclusion_texto); }
+        if (cerrar_conclusion) { sets.push(`conclusion_cerrada = TRUE`); }
+        if (sets.length === 0) return res.json({ ok: true });
+        vals.push(id);
+        await pool.query(
+            `UPDATE actas_comite SET ${sets.join(', ')} WHERE id = $${i}::uuid`,
+            vals
+        );
+        return res.json({ ok: true });
+    } catch (err) {
+        console.error('Error actualizando textos acta:', err);
+        return res.status(500).json({ error: 'Error al actualizar acta' });
+    }
+});
+
+// PATCH /api/secretaria/actas/:id/firmantes
+// Permite fijar, para esta acta puntual, quién firma como Directora y Secretaria
+// del Comité (pueden variar de una sesión a otra en vez de usar siempre el
+// valor único configurado en configuracion_firmantes).
+app.patch('/api/secretaria/actas/:id/firmantes', async (req, res) => {
+    const { id } = req.params;
+    const {
+        firmante_directora_nombre, firmante_directora_cargo,
+        firmante_secretaria_nombre, firmante_secretaria_cargo,
+    } = req.body;
+    try {
+        const sets = [];
+        const vals = [];
+        let i = 1;
+        if (firmante_directora_nombre !== undefined) { sets.push(`firmante_directora_nombre = $${i++}`); vals.push(firmante_directora_nombre); }
+        if (firmante_directora_cargo !== undefined) { sets.push(`firmante_directora_cargo = $${i++}`); vals.push(firmante_directora_cargo); }
+        if (firmante_secretaria_nombre !== undefined) { sets.push(`firmante_secretaria_nombre = $${i++}`); vals.push(firmante_secretaria_nombre); }
+        if (firmante_secretaria_cargo !== undefined) { sets.push(`firmante_secretaria_cargo = $${i++}`); vals.push(firmante_secretaria_cargo); }
+        if (sets.length === 0) return res.json({ ok: true });
+        vals.push(id);
+        await pool.query(
+            `UPDATE actas_comite SET ${sets.join(', ')} WHERE id = $${i}::uuid`,
+            vals
+        );
+        return res.json({ ok: true });
+    } catch (err) {
+        console.error('Error actualizando firmantes del acta:', err);
+        return res.status(500).json({ error: 'Error al actualizar firmantes del acta' });
     }
 });
 
@@ -1750,8 +2010,9 @@ app.post('/api/solicitudes/:id/juridica', async (req, res) => {
 
             if (requiereFlujoSecuencialJuridica(modalidad)) {
                 const estadoFlujo = await obtenerEstadoFlujoJuridica(id);
-                if (!ORDEN_FLUJO_JURIDICA.every((p) => pasoFlujoCompletado(p, estadoFlujo))) {
-                    return res.status(400).json({ error: mensajeFlujoIncompleto(estadoFlujo) });
+                const orden = ordenFlujoParaModalidad(modalidad);
+                if (!orden.every((p) => pasoFlujoCompletado(p, estadoFlujo))) {
+                    return res.status(400).json({ error: mensajeFlujoIncompleto(estadoFlujo, orden) });
                 }
             }
         }
@@ -1800,11 +2061,11 @@ app.post('/api/sharepoint/crear-repositorio', async (req, res) => {
 
     try {
         await ensureJuridicaDetailStorage();
-        
+
         const tenantId = process.env.AZURE_TENANT_ID;
         const clientId = process.env.AZURE_CLIENT_ID;
         const clientSecret = process.env.AZURE_CLIENT_SECRET;
-        
+
         // 1. Obtener Token de la Aplicación (Client Credentials)
         const fetchFn = process.env.fetch || global.fetch || fetch;
         const tokenRes = await fetchFn(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
@@ -1823,11 +2084,11 @@ app.post('/api/sharepoint/crear-repositorio', async (req, res) => {
 
         // 2. Traer el codigo de la solicitud para el nombre de la carpeta
         const codRes = await pool.query('SELECT codigo FROM solicitudes WHERE id = $1', [solicitudId]);
-        const codigo = codRes.rows[0]?.codigo || `Solicitud_${solicitudId.substring(0,6)}`;
+        const codigo = codRes.rows[0]?.codigo || `Solicitud_${solicitudId.substring(0, 6)}`;
 
         // 3. Crear la carpeta principal
         const driveUrl = `https://graph.microsoft.com/v1.0/sites/investinbogota.sharepoint.com:/sites/Documental:/drive/root/children`;
-        
+
         const mainRes = await fetch(driveUrl, {
             method: 'POST',
             headers: {
@@ -2089,10 +2350,16 @@ async function ensurePresupuestoVigencia() {
             gerencia_nombre VARCHAR(255) NOT NULL,
             vigencia INTEGER NOT NULL,
             monto_total NUMERIC(18,2) NOT NULL DEFAULT 0,
+            comprometido_vigencia_anterior NUMERIC(18,2) NOT NULL DEFAULT 0,
             creado_en TIMESTAMPTZ DEFAULT NOW(),
             actualizado_en TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(gerencia_nombre, vigencia)
         )
+    `);
+    // Migración no destructiva: agrega la columna si la tabla ya existía sin ella
+    await pool.query(`
+        ALTER TABLE presupuesto_vigencia
+        ADD COLUMN IF NOT EXISTS comprometido_vigencia_anterior NUMERIC(18,2) NOT NULL DEFAULT 0
     `);
 }
 
@@ -2107,6 +2374,7 @@ app.get('/api/financiera/presupuesto-vigencia', async (req, res) => {
                 pv.gerencia_nombre,
                 pv.vigencia,
                 pv.monto_total::bigint AS monto_total,
+                pv.comprometido_vigencia_anterior::bigint AS comprometido_vigencia_anterior,
 
                 -- Comprometido FIRME: jurídica aprobó = contrato firmado
                 COALESCE(SUM(s.presupuesto_aprobado) FILTER (
@@ -2118,8 +2386,9 @@ app.get('/api/financiera/presupuesto-vigencia', async (req, res) => {
                     WHERE s.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica')
                 ), 0)::bigint AS certificado,
 
-                -- Disponible real = total − comprometido − certificado
+                -- Disponible real = total − reservas vigencia anterior − comprometido firme − certificado
                 (pv.monto_total
+                    - pv.comprometido_vigencia_anterior
                     - COALESCE(SUM(s.presupuesto_aprobado) FILTER (WHERE s.estado IN ('aprobado_juridica','finalizado','contratado','cerrado')), 0)
                     - COALESCE(SUM(s.presupuesto_aprobado) FILTER (WHERE s.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica')), 0)
                 )::bigint AS disponible
@@ -2129,7 +2398,7 @@ app.get('/api/financiera/presupuesto-vigencia', async (req, res) => {
                ON s.rubro = pv.gerencia_nombre
               AND EXTRACT(YEAR FROM s.actualizado_en) = pv.vigencia
              WHERE pv.vigencia = $1
-             GROUP BY pv.id, pv.gerencia_nombre, pv.vigencia, pv.monto_total
+             GROUP BY pv.id, pv.gerencia_nombre, pv.vigencia, pv.monto_total, pv.comprometido_vigencia_anterior
              ORDER BY pv.gerencia_nombre`,
             [vigencia]
         );
@@ -2140,21 +2409,31 @@ app.get('/api/financiera/presupuesto-vigencia', async (req, res) => {
     }
 });
 
-// POST /api/financiera/presupuesto-vigencia  { vigencia, gerencia_nombre, monto_total }
+// POST /api/financiera/presupuesto-vigencia  { vigencia, gerencia_nombre, monto_total, comprometido_vigencia_anterior }
 app.post('/api/financiera/presupuesto-vigencia', async (req, res) => {
-    const { vigencia, gerencia_nombre, monto_total } = req.body;
+    const { vigencia, gerencia_nombre, monto_total, comprometido_vigencia_anterior } = req.body;
     if (!vigencia || !gerencia_nombre || monto_total == null) {
         return res.status(400).json({ error: 'Se requieren vigencia, gerencia_nombre y monto_total' });
+    }
+    const reservaAnterior = Number(comprometido_vigencia_anterior) || 0;
+    if (reservaAnterior < 0) {
+        return res.status(400).json({ error: 'Las reservas de vigencias anteriores no pueden ser negativas.' });
+    }
+    if (reservaAnterior > Number(monto_total)) {
+        return res.status(400).json({ error: 'Las reservas de vigencias anteriores no pueden superar el monto apropiado.' });
     }
     try {
         await ensurePresupuestoVigencia();
         const result = await pool.query(
-            `INSERT INTO presupuesto_vigencia (gerencia_nombre, vigencia, monto_total)
-             VALUES ($1, $2, $3)
+            `INSERT INTO presupuesto_vigencia (gerencia_nombre, vigencia, monto_total, comprometido_vigencia_anterior)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT (gerencia_nombre, vigencia)
-             DO UPDATE SET monto_total = EXCLUDED.monto_total, actualizado_en = NOW()
-             RETURNING id, gerencia_nombre, vigencia, monto_total::bigint`,
-            [gerencia_nombre, vigencia, monto_total]
+             DO UPDATE SET
+                monto_total = EXCLUDED.monto_total,
+                comprometido_vigencia_anterior = EXCLUDED.comprometido_vigencia_anterior,
+                actualizado_en = NOW()
+             RETURNING id, gerencia_nombre, vigencia, monto_total::bigint, comprometido_vigencia_anterior::bigint`,
+            [gerencia_nombre, vigencia, monto_total, reservaAnterior]
         );
         return res.status(200).json(result.rows[0]);
     } catch (err) {
@@ -2233,6 +2512,8 @@ function pasoFlujoCompletado(paso, estado) {
 }
 
 const ORDEN_FLUJO_JURIDICA = ['revision_inicial', 'invitacion', 'calificacion', 'adjudicacion', 'documentos_finales'];
+// Directa no requiere invitación/calificación/adjudicación: no hay competencia entre proponentes.
+const ORDEN_FLUJO_JURIDICA_DIRECTA = ['revision_inicial', 'documentos_finales'];
 const LABEL_PASO_JURIDICA = {
     revision_inicial: 'Revisión inicial',
     invitacion: 'Invitación',
@@ -2241,14 +2522,19 @@ const LABEL_PASO_JURIDICA = {
     documentos_finales: 'Cargue de documentos finales',
 };
 
-function pasoFlujoAccesible(paso, estado) {
-    const idx = ORDEN_FLUJO_JURIDICA.indexOf(paso);
-    if (idx <= 0) return true;
-    return pasoFlujoCompletado(ORDEN_FLUJO_JURIDICA[idx - 1], estado);
+function ordenFlujoParaModalidad(modalidad) {
+    const m = String(modalidad || '').toLowerCase();
+    return m === 'directa' ? ORDEN_FLUJO_JURIDICA_DIRECTA : ORDEN_FLUJO_JURIDICA;
 }
 
-function mensajeFlujoIncompleto(estado) {
-    for (const paso of ORDEN_FLUJO_JURIDICA) {
+function pasoFlujoAccesible(paso, estado, orden = ORDEN_FLUJO_JURIDICA) {
+    const idx = orden.indexOf(paso);
+    if (idx <= 0) return true;
+    return pasoFlujoCompletado(orden[idx - 1], estado);
+}
+
+function mensajeFlujoIncompleto(estado, orden = ORDEN_FLUJO_JURIDICA) {
+    for (const paso of orden) {
         if (!pasoFlujoCompletado(paso, estado)) {
             return `Complete el paso "${LABEL_PASO_JURIDICA[paso]}" antes de aprobar legalmente.`;
         }
@@ -2256,10 +2542,10 @@ function mensajeFlujoIncompleto(estado) {
     return 'Complete todos los pasos del flujo jurídico antes de aprobar.';
 }
 
-function validarAccionFlujo(pasoRequerido, estado) {
-    if (!pasoFlujoAccesible(pasoRequerido, estado)) {
-        const idx = ORDEN_FLUJO_JURIDICA.indexOf(pasoRequerido);
-        const prev = idx > 0 ? ORDEN_FLUJO_JURIDICA[idx - 1] : null;
+function validarAccionFlujo(pasoRequerido, estado, orden = ORDEN_FLUJO_JURIDICA) {
+    if (!pasoFlujoAccesible(pasoRequerido, estado, orden)) {
+        const idx = orden.indexOf(pasoRequerido);
+        const prev = idx > 0 ? orden[idx - 1] : null;
         return {
             ok: false,
             error: prev
@@ -2286,10 +2572,9 @@ app.get('/api/juridica/solicitudes', async (_req, res) => {
     }
 });
 
-// GET /api/juridica/solicitudes/:id/calificacion
-app.get('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
-    const { id } = req.params;
-    try {
+// Construye el detalle de calificación (info de solicitud + proponentes + evaluación guardada)
+// compartido entre la vista de Jurídica y la vista de Supervisor (calificación concurrente).
+async function construirDetalleCalificacion(id) {
         await ensureJuridicaDetailStorage();
 
         const solRes = await pool.query(
@@ -2298,7 +2583,7 @@ app.get('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
              WHERE id = $1::uuid`,
             [id]
         );
-        if (solRes.rows.length === 0) return res.status(404).json({ error: 'Solicitud no encontrada' });
+        if (solRes.rows.length === 0) return { error: 'Solicitud no encontrada', status: 404 };
         const solicitud = solRes.rows[0];
 
         // 1. Obtener todas las invitaciones de esta solicitud.
@@ -2415,14 +2700,25 @@ app.get('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
         );
         const invEnviadas = await invitacionesEnviadasPara(id);
 
-        return res.json({
-            solicitud,
-            proponentes: proponentesFinal,
-            invitaciones_enviadas: invEnviadas,
-            total_invitaciones: parseInt(convCount.rows[0].total || '0', 10),
-            evaluacion: evaluacionJson,
-            repositorio_sharepoint_creado: detRes.rows[0]?.repositorio_sharepoint_creado || false
-        });
+        return {
+            data: {
+                solicitud,
+                proponentes: proponentesFinal,
+                invitaciones_enviadas: invEnviadas,
+                total_invitaciones: parseInt(convCount.rows[0].total || '0', 10),
+                evaluacion: evaluacionJson,
+                repositorio_sharepoint_creado: detRes.rows[0]?.repositorio_sharepoint_creado || false
+            }
+        };
+}
+
+// GET /api/juridica/solicitudes/:id/calificacion
+app.get('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await construirDetalleCalificacion(id);
+        if (result.error) return res.status(result.status || 500).json({ error: result.error });
+        return res.json(result.data);
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al obtener calificación jurídica' });
@@ -2445,13 +2741,15 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
         proponentes_editados = [],
         email = null,
         firmas = {},
-        finalizada = false
+        finalizada = false,
+        habilitantes_revisados = []
     } = req.body || {};
 
     const numeroRecomendadoRaw = proponente_recomendado_numero != null ? Number(proponente_recomendado_numero) : null;
     const numeroRecomendado = Number.isFinite(numeroRecomendadoRaw) && numeroRecomendadoRaw > 0
         ? Math.trunc(numeroRecomendadoRaw)
         : null;
+    const habilitantesRevisadosNums = Array.isArray(habilitantes_revisados) ? habilitantes_revisados.map(Number) : [];
 
     const client = await pool.connect();
     try {
@@ -2484,6 +2782,32 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
             return res.status(403).json({ error: 'La calificación ya fue finalizada y no puede modificarse.' });
         }
 
+        if (finalizada === true) {
+            const detalle = await construirDetalleCalificacion(id);
+            const proponentesQueRespondieron = Array.isArray(detalle?.data?.proponentes)
+                ? detalle.data.proponentes.filter(p => p.respondida)
+                : [];
+            const faltantes = proponentesQueRespondieron.filter(p => !habilitantesRevisadosNums.includes(Number(p.numero)));
+            if (faltantes.length > 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({
+                    error: 'Debe revisar el detalle de requisitos habilitantes de todos los proponentes antes de finalizar.'
+                });
+            }
+
+            const supervisorRecomendado = prevEv.supervisor?.proponente_recomendado_numero != null
+                ? Number(prevEv.supervisor.proponente_recomendado_numero)
+                : null;
+            if (supervisorRecomendado != null && numeroRecomendado != null
+                && supervisorRecomendado !== numeroRecomendado
+                && !String(evaluacion_consolidada || '').trim()) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({
+                    error: `Jurídica recomienda al Proponente ${numeroRecomendado} y el Supervisor recomienda al Proponente ${supervisorRecomendado}. Debe justificar la decisión en la evaluación consolidada antes de finalizar.`
+                });
+            }
+        }
+
         // ─── Auditoría de cambios en proponentes ──────────────────
         let userId = null;
         if (email) {
@@ -2503,12 +2827,12 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
                 if (oldProp.rows.length > 0) {
                     const op = oldProp.rows[0];
                     const fields = ['datos_contacto', 'requisitos_tecnicos', 'experiencia', 'criterios_habilitantes', 'valor_con_impuestos', 'valor_agregado', 'observaciones', 'correo'];
-                    
+
                     for (const field of fields) {
                         if (pe[field] === undefined) continue;
                         const newVal = pe[field];
                         const oldVal = op[field];
-                        
+
                         let isDifferent = false;
                         if (field === 'valor_con_impuestos') {
                             isDifferent = Math.abs(Number(newVal || 0) - Number(oldVal || 0)) > 0.01;
@@ -2521,7 +2845,7 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
                                 `UPDATE proponentes SET ${field} = $1, actualizado_en = NOW() WHERE id = $2`,
                                 [newVal, op.id]
                             );
-                            
+
                             await client.query(
                                 `INSERT INTO auditoria (tabla, registro_id, accion, campo, valor_anterior, valor_nuevo, usuario_id)
                                  VALUES ('proponentes', $1, 'UPDATE', $2, $3, $4, $5)`,
@@ -2537,8 +2861,10 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
             flujo: prevEv.flujo || {},
             acta_generada: prevEv.acta_generada || false,
             acta_generada_en: prevEv.acta_generada_en || null,
+            supervisor: prevEv.supervisor || null,
             finalizada: finalizada === true ? true : (prevEv.finalizada || false),
             finalizada_en: finalizada === true ? new Date().toISOString() : (prevEv.finalizada_en || null),
+            habilitantes_revisados: habilitantesRevisadosNums,
             calificaciones: Array.isArray(calificaciones) ? calificaciones.map((c) => ({
                 numero: Number.isFinite(Number(c?.numero)) ? Number(c.numero) : null,
                 propuesta_economica: Number(c?.propuesta_economica ?? c?.requisitos_habilitantes ?? 0),
@@ -2809,7 +3135,7 @@ app.post('/api/juridica/solicitudes/:id/documentos', async (req, res) => {
 
         if (requiereFlujoSecuencialJuridica(solRes.rows[0].modalidad) && tiposFinales.includes(tipo)) {
             const estadoFlujo = await obtenerEstadoFlujoJuridica(id);
-            const gate = validarAccionFlujo('documentos_finales', estadoFlujo);
+            const gate = validarAccionFlujo('documentos_finales', estadoFlujo, ordenFlujoParaModalidad(solRes.rows[0].modalidad));
             if (!gate.ok) return res.status(409).json({ error: gate.error });
         }
 
@@ -2914,7 +3240,7 @@ app.post('/api/juridica/solicitudes/:id/documentos/upload', (req, res, next) => 
 
         if (requiereFlujoSecuencialJuridica(solRes.rows[0].modalidad) && tipo !== 'otro') {
             const estadoFlujo = await obtenerEstadoFlujoJuridica(id);
-            const gate = validarAccionFlujo('documentos_finales', estadoFlujo);
+            const gate = validarAccionFlujo('documentos_finales', estadoFlujo, ordenFlujoParaModalidad(solRes.rows[0].modalidad));
             if (!gate.ok) return res.status(409).json({ error: gate.error });
         }
 
@@ -2989,6 +3315,7 @@ app.get('/api/juridica/historial', async (_req, res) => {
                 s.id,
                 s.codigo,
                 s.objeto,
+                s.titulo_contrato,
                 s.modalidad,
                 s.estado,
                 s.solicitante_nombre,
@@ -3105,7 +3432,7 @@ app.get('/api/juridica/metrics', async (req, res) => {
             LEFT JOIN solicitudes_detalle_juridico d ON d.solicitud_id = s.id
         `;
         const result = await pool.query(statsQuery);
-        
+
         // Actividad reciente para jurídica
         const activityQuery = `
             SELECT s.id, s.codigo, s.objeto, s.estado, s.actualizado_en as fecha,
@@ -3192,14 +3519,15 @@ app.post('/api/facturas/upload', (req, res) => {
 // ─── FACTURAS POR CONTRATO ────────────────────────────────────────────────────
 
 // GET /api/financiera/contratos — lista de contratos activos para el selector del formulario
+// Sólo contratos con jurídica aprobada (contrato firmado) pueden facturar.
 app.get('/api/financiera/contratos', async (_req, res) => {
     try {
         const result = await pool.query(
-            `SELECT s.id, s.codigo, s.objeto,
+            `SELECT s.id, s.codigo, s.objeto, s.titulo_contrato,
                     u.nombre AS supervisor_nombre, u.email AS supervisor_email
              FROM solicitudes s
              LEFT JOIN usuarios u ON u.id = s.supervision_id
-             WHERE s.estado NOT IN ('borrador','rechazado')
+             WHERE s.estado IN ('aprobado_juridica','contratado','finalizado','cerrado')
              ORDER BY s.codigo DESC`
         );
         return res.json(result.rows);
@@ -3221,6 +3549,13 @@ app.post('/api/financiera/facturas', async (req, res) => {
         return res.status(400).json({ error: 'solicitud_id, fecha_factura, no_contrato_oc, no_factura_cxc y concepto son requeridos' });
     }
     try {
+        const solRes = await pool.query('SELECT estado FROM solicitudes WHERE id = $1', [solicitud_id]);
+        if (solRes.rows.length === 0) return res.status(404).json({ error: 'Solicitud no encontrada' });
+        const ESTADOS_CONTRATO_FIRMADO = ['aprobado_juridica', 'contratado', 'finalizado', 'cerrado'];
+        if (!ESTADOS_CONTRATO_FIRMADO.includes(solRes.rows[0].estado)) {
+            return res.status(409).json({ error: 'No se puede registrar la factura: el contrato aún no ha sido aprobado por jurídica' });
+        }
+
         const result = await pool.query(
             `INSERT INTO facturas_contrato
                (solicitud_id, nombre_solicitud, aprobador_1, aprobador_2,
@@ -3229,8 +3564,8 @@ app.post('/api/financiera/facturas', async (req, res) => {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pendiente')
              RETURNING *`,
             [solicitud_id, nombre_solicitud || null, aprobador_1 || null, aprobador_2 || null,
-             fecha_factura, no_contrato_oc, no_factura_cxc, concepto,
-             parseFloat(valor) || 0, certificacion_supervisor ?? null, adjunto_url || null, adjunto_nombre || null, creado_por_email || null]
+                fecha_factura, no_contrato_oc, no_factura_cxc, concepto,
+                parseFloat(valor) || 0, certificacion_supervisor ?? null, adjunto_url || null, adjunto_nombre || null, creado_por_email || null]
         );
         return res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -3430,7 +3765,7 @@ app.post('/api/supervisor/contratos/:id/facturas', async (req, res) => {
 app.get('/api/financiera/facturas', async (_req, res) => {
     try {
         const result = await pool.query(
-            'SELECT fc.*, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto FROM facturas_contrato fc JOIN solicitudes s ON s.id = fc.solicitud_id ORDER BY fc.creado_en DESC'
+            'SELECT fc.*, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto, s.titulo_contrato AS contrato_titulo FROM facturas_contrato fc JOIN solicitudes s ON s.id = fc.solicitud_id ORDER BY fc.creado_en DESC'
         );
         return res.json(result.rows);
     } catch (err) {
@@ -3612,7 +3947,7 @@ app.get('/api/admin/usuarios', async (req, res) => {
     try {
         const [usersResult, permissionsMap] = await Promise.all([
             pool.query(
-            `SELECT u.*, g.nombre as gerencia_nombre 
+                `SELECT u.*, g.nombre as gerencia_nombre 
              FROM usuarios u
              LEFT JOIN gerencias g ON u.gerencia_id = g.id
              ORDER BY u.nombre`
@@ -3934,6 +4269,11 @@ async function ensureConvocatoriasStorage() {
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS cedula_nit TEXT`);
     // Teléfono del proponente registrado públicamente
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS telefono TEXT`);
+    // Aceptación de la política de tratamiento de datos personales (Ley 1581 de 2012 - Habeas Data)
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS acepta_tratamiento_datos BOOLEAN NOT NULL DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS acepta_tratamiento_datos_en TIMESTAMPTZ`);
+    // Tipo de proponente registrado ('persona' | 'empresa') — solo aplica a registros vía link público
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS tipo_persona TEXT`);
 }
 
 // POST /api/convocatorias/upload-documento
@@ -4006,7 +4346,7 @@ app.post('/api/convocatorias', async (req, res) => {
                  VALUES ($1, $2, $3, $4)
                  ON CONFLICT DO NOTHING`,
                 [convocatoria.id, p.email.toLowerCase().trim(), p.nombre || '', token]
-            ).catch(() => {}); // ignorar duplicados
+            ).catch(() => { }); // ignorar duplicados
         }
 
         await client.query('COMMIT');
@@ -4071,7 +4411,11 @@ app.patch('/api/convocatorias/:id', async (req, res) => {
         const convRes = await pool.query(`SELECT fase_invitacion_enviada FROM convocatorias WHERE id = $1::uuid`, [id]);
         if (convRes.rows.length === 0) return res.status(404).json({ error: 'Convocatoria no encontrada.' });
         if (convRes.rows[0].fase_invitacion_enviada) {
-            return res.status(409).json({ error: 'No se puede editar una convocatoria con Fase 2 ya enviada.' });
+            // Después de Fase 2 solo se permite ampliar el plazo de propuesta (fecha_limite)
+            const intentaEditarOtros = descripcion_requisitos !== undefined || documento_adjunto_url !== undefined || documento_adjunto_nombre !== undefined;
+            if (intentaEditarOtros || fecha_limite === undefined) {
+                return res.status(409).json({ error: 'No se puede editar una convocatoria con Fase 2 ya enviada.' });
+            }
         }
         const updates = [];
         const params = [];
@@ -4103,7 +4447,9 @@ app.get('/api/convocatorias/:id', async (req, res) => {
             `SELECT id, proponente_email, proponente_nombre, token, respondida, respondida_en,
                     respuesta_texto, respuesta_archivos,
                     primer_acceso_en, ip_acceso, total_accesos,
-                    es_postulacion_publica, telefono, link_enviado_en
+                    es_postulacion_publica, telefono, link_enviado_en,
+                    cedula_nit, acepta_tratamiento_datos, acepta_tratamiento_datos_en, creado_en,
+                    tipo_persona
              FROM convocatoria_invitaciones
              WHERE convocatoria_id = $1::uuid
              ORDER BY creado_en ASC`,
@@ -4459,11 +4805,12 @@ app.get('/api/convocatoria-publica/:id', proponenteRateLimit, async (req, res) =
 // Crea una invitación nueva en convocatoria_invitaciones con es_postulacion_publica = TRUE.
 app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (req, res) => {
     const { id } = req.params;
-    const { nombre_empresa, nombre_contacto, nit, nombre_completo, cedula, email, telefono } = req.body;
+    const { nombre_empresa, nombre_contacto, nit, nombre_completo, cedula, email, telefono, acepta_tratamiento_datos } = req.body;
 
     if (!email) return res.status(400).json({ error: 'El correo electrónico es obligatorio.' });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'El correo electrónico no es válido.' });
     if (!nombre_empresa && !nombre_completo) return res.status(400).json({ error: 'El nombre es obligatorio.' });
+    if (acepta_tratamiento_datos !== true) return res.status(400).json({ error: 'Debes aceptar la Política de Tratamiento de Datos Personales para continuar.' });
 
     const client = await pool.connect();
     try {
@@ -4511,26 +4858,29 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
         const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
 
         // Construir nombre y cédula/NIT según el tipo de proponente
-        let nombreRegistro, cedulaNit;
+        let nombreRegistro, cedulaNit, tipoPersona;
         if (nombre_completo) {
             // Persona natural
             nombreRegistro = nombre_completo.trim();
             cedulaNit = cedula || null;
+            tipoPersona = 'persona';
         } else {
             // Empresa
             nombreRegistro = nombre_contacto ? `${nombre_empresa} — ${nombre_contacto}` : nombre_empresa;
             cedulaNit = nit || null;
+            tipoPersona = 'empresa';
         }
 
         const invRes = await client.query(
             `INSERT INTO convocatoria_invitaciones
                 (convocatoria_id, proponente_email, proponente_nombre, token,
-                 es_postulacion_publica, telefono, cedula_nit,
+                 es_postulacion_publica, telefono, cedula_nit, tipo_persona,
                  primer_acceso_en, ip_acceso, total_accesos,
-                 respondida, respuesta_archivos)
-             VALUES ($1::uuid, $2, $3, $4, TRUE, $5, $6, NOW(), $7, 1, FALSE, '[]'::jsonb)
+                 respondida, respuesta_archivos,
+                 acepta_tratamiento_datos, acepta_tratamiento_datos_en)
+             VALUES ($1::uuid, $2, $3, $4, TRUE, $5, $6, $7, NOW(), $8, 1, FALSE, '[]'::jsonb, TRUE, NOW())
              RETURNING id, token`,
-            [id, email.toLowerCase().trim(), nombreRegistro, token, telefono || null, cedulaNit, ip]
+            [id, email.toLowerCase().trim(), nombreRegistro, token, telefono || null, cedulaNit, tipoPersona, ip]
         );
 
         await client.query('COMMIT');
@@ -4863,7 +5213,7 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
             `UPDATE convocatoria_invitaciones SET link_enviado_en = NOW()
              WHERE convocatoria_id = $1::uuid AND link_enviado_en IS NULL`,
             [id]
-        ).catch(() => {});
+        ).catch(() => { });
         // Cerrar el link público automáticamente: ya no se aceptan más registros
         await pool.query(
             `UPDATE convocatorias
@@ -4872,7 +5222,7 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
                  link_publico_activo     = FALSE
              WHERE id = $1::uuid`,
             [id]
-        ).catch(() => {});
+        ).catch(() => { });
 
         // 7. Preparar adjunto del documento si existe
         const docAttachments = [];
@@ -5128,7 +5478,7 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
         await pool.query(
             `UPDATE convocatoria_invitaciones SET link_enviado_en = NOW() WHERE id = $1::uuid`,
             [invId]
-        ).catch(() => {}); // columna opcional, ignorar si no existe
+        ).catch(() => { }); // columna opcional, ignorar si no existe
 
         await registrarLog({
             tipo_log: 'negocio', modulo: 'convocatorias', tabla: 'convocatoria_invitaciones',
@@ -5180,6 +5530,17 @@ app.put('/api/convocatorias/:id/link-publico', async (req, res) => {
     }
 })();
 
+// ─── Migración 41: fechas estimadas en tabla solicitudes ──────
+(async () => {
+    try {
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS fecha_estimada_solicitud DATE`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS fecha_estimada_recepcion DATE`);
+        console.log('✓ Columnas fecha_estimada_solicitud / fecha_estimada_recepcion verificadas en solicitudes');
+    } catch (e) {
+        console.error('Advertencia al verificar columnas fecha_estimada:', e.message);
+    }
+})();
+
 // ─── Migración: tabla seguimiento actas de adjudicación firmadas ─
 (async () => {
     try {
@@ -5210,9 +5571,70 @@ app.put('/api/convocatorias/:id/link-publico', async (req, res) => {
         await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS pagado_financiera BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS fecha_pago_financiera DATE`);
         await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS confirmado_por_financiera TEXT`);
-        console.log('✓ Columnas pagado_financiera verificadas en facturas_contrato');
+        await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS valor NUMERIC(18,2) DEFAULT 0`);
+        console.log('✓ Columnas pagado_financiera/valor verificadas en facturas_contrato');
     } catch (e) {
         console.error('Advertencia al verificar columnas pago financiera:', e.message);
+    }
+})();
+
+// ─── Migración: columnas faltantes en solicitudes ─────────────
+(async () => {
+    try {
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS anexos_solicitante TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS analisis_plazo_promedio_meses TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS analisis_plazo_promedio_dias TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS justificacion_anticipo TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS obligaciones_especificas TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS entregables_detalle TEXT`);
+        console.log('✓ Columnas faltantes verificadas en solicitudes');
+    } catch (e) {
+        console.error('Advertencia al verificar columnas faltantes en solicitudes:', e.message);
+    }
+})();
+
+// ─── Inicializar tabla jurídica al arranque ───────────────────
+(async () => {
+    try {
+        await ensureJuridicaDetailStorage();
+        console.log('✓ Tabla solicitudes_detalle_juridico verificada');
+    } catch (e) {
+        console.error('Advertencia al verificar tabla juridica:', e.message);
+    }
+})();
+
+// ─── Migración: columnas financiera + rubros + enum estados ──
+(async () => {
+    try {
+        // Columnas que financiera necesita en solicitudes
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS rubro VARCHAR(255)`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS presupuesto_aprobado NUMERIC(18,2)`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS resultado_juridica TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS informes_supervision BOOLEAN DEFAULT FALSE`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS numero_informes INTEGER DEFAULT 0`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS titulo_contrato TEXT`);
+
+        // Tabla de rubros presupuestales (catálogo)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS rubros_presupuestales (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                codigo          VARCHAR(20),
+                nombre          VARCHAR(200) NOT NULL,
+                gerencia_nombre VARCHAR(200),
+                activo          BOOLEAN NOT NULL DEFAULT TRUE,
+                creado_en       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+
+        // Valores de enum que faltan (deben ejecutarse fuera de transacción — pool.query es auto-commit)
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'enviado_juridica'`);
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'finalizado'`);
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'aprobado_comite'`);
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'rechazado_comite'`);
+
+        console.log('✓ Columnas financiera, rubros_presupuestales y enum estados verificados');
+    } catch (e) {
+        console.error('Advertencia al verificar columnas financiera/enum:', e.message);
     }
 })();
 

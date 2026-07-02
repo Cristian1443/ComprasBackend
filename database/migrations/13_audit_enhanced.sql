@@ -49,7 +49,7 @@ BEGIN
     -- Cambio de ESTADO
     IF OLD.estado IS DISTINCT FROM NEW.estado THEN
         v_descripcion := 'Solicitud ' || COALESCE(NEW.codigo, NEW.id::text) ||
-                         ' cambió de estado: ' || COALESCE(OLD.estado, 'inicial') ||
+                         ' cambió de estado: ' || COALESCE(OLD.estado::TEXT, 'inicial') ||
                          ' → ' || NEW.estado;
         INSERT INTO auditoria
             (tipo_log, modulo, tabla, registro_id, accion, campo, valor_anterior, valor_nuevo, descripcion, usuario_id, resultado)

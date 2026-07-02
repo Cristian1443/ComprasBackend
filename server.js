@@ -3787,7 +3787,7 @@ app.get('/api/financiera/resumen-ejecucion', async (_req, res) => {
                 COALESCE(SUM(CASE WHEN fc.estado = 'pendiente' THEN fc.valor ELSE 0 END), 0) AS total_pendiente
             FROM solicitudes s
             LEFT JOIN facturas_contrato fc ON fc.solicitud_id = s.id
-            WHERE s.estado NOT IN ('borrador', 'rechazado')
+            WHERE s.estado NOT IN ('borrador', 'rechazado_gerente', 'rechazado_juridica', 'rechazado_financiera', 'rechazado_comite', 'cancelado')
         `);
 
         // Detalle por contrato
@@ -3806,7 +3806,7 @@ app.get('/api/financiera/resumen-ejecucion', async (_req, res) => {
             FROM solicitudes s
             LEFT JOIN facturas_contrato fc ON fc.solicitud_id = s.id
             LEFT JOIN usuarios u ON u.id = s.supervision_id
-            WHERE s.estado NOT IN ('borrador', 'rechazado')
+            WHERE s.estado NOT IN ('borrador', 'rechazado_gerente', 'rechazado_juridica', 'rechazado_financiera', 'rechazado_comite', 'cancelado')
             GROUP BY s.id, s.codigo, s.objeto, s.valor_en_cop, u.nombre
             ORDER BY total_facturado DESC
         `);

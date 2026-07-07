@@ -687,7 +687,7 @@ app.post('/api/solicitudes', async (req, res) => {
                 entregable1 || null, entregable2 || null, entregable3 || null,
                 req.body.analisis_plazo_promedio_meses || null, req.body.analisis_plazo_promedio_dias || null,
                 req.body.justificacion_anticipo || null,
-                JSON.stringify(modalidadNormalizada === 'directa' ? [] : (req.body.obligaciones_especificas || [])),
+                JSON.stringify(req.body.obligaciones_especificas || []),
                 JSON.stringify(req.body.entregables_detalle || []),
                 req.body.fecha_estimada_solicitud || null,
                 req.body.fecha_estimada_recepcion || null
@@ -875,7 +875,7 @@ app.put('/api/solicitudes/:id', async (req, res) => {
                 entregable1 || null, entregable2 || null, entregable3 || null,
                 req.body.analisis_plazo_promedio_dias || null,
                 req.body.justificacion_anticipo || null,
-                JSON.stringify(modalidadNormalizada === 'directa' ? [] : (req.body.obligaciones_especificas || [])),
+                JSON.stringify(req.body.obligaciones_especificas || []),
                 JSON.stringify(req.body.entregables_detalle || []),
                 req.body.fecha_estimada_solicitud || null,
                 req.body.fecha_estimada_recepcion || null
@@ -976,7 +976,10 @@ app.put('/api/solicitudes/:id/finalizar', async (req, res) => {
     const { id } = req.params;
     try {
         const result = await pool.query(
-            `UPDATE solicitudes SET estado = 'finalizado', actualizado_en = NOW()
+            `UPDATE solicitudes
+             SET estado = 'finalizado',
+                 fecha_fin_contrato = COALESCE(fecha_fin_contrato, NOW()::date),
+                 actualizado_en = NOW()
              WHERE id = $1 AND estado = 'aprobado_financiera'
              RETURNING id, codigo, estado`,
             [id]
@@ -2025,6 +2028,10 @@ app.post('/api/solicitudes/:id/juridica', async (req, res) => {
                  comentario_juridica = COALESCE($2::text, comentario_juridica),
                  estado = $4::estado_solicitud,
                  fecha_respuesta_juridica = NOW(),
+                 fecha_inicio_contrato = CASE
+                     WHEN $4::estado_solicitud = 'aprobado_juridica' THEN COALESCE(fecha_inicio_contrato, NOW()::date)
+                     ELSE fecha_inicio_contrato
+                 END,
                  actualizado_en = NOW()
              WHERE id = $3::uuid
              RETURNING id, codigo, estado, resultado_juridica`,
@@ -3701,6 +3708,34 @@ app.get('/api/supervisor/facturas-pendientes', async (req, res) => {
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al obtener facturas pendientes' });
+    }
+});
+
+// GET /api/supervisor/historial-facturas?email=
+// Histórico de facturas ya decididas (aprobadas o rechazadas) por el supervisor/solicitante
+app.get('/api/supervisor/historial-facturas', async (req, res) => {
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ error: 'email requerido' });
+    try {
+        const userRes = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email]);
+        if (userRes.rows.length === 0) return res.json([]);
+        const userId = userRes.rows[0].id;
+        const result = await pool.query(
+            `SELECT fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.concepto, fc.valor,
+                    fc.fecha_factura, fc.estado, fc.aprobado_supervisor, fc.comentario_supervisor,
+                    fc.actualizado_en, fc.creado_en,
+                    s.id AS solicitud_id, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto
+             FROM facturas_contrato fc
+             JOIN solicitudes s ON s.id = fc.solicitud_id
+             WHERE s.supervision_id = $1
+               AND fc.aprobado_supervisor IS NOT NULL
+             ORDER BY fc.actualizado_en DESC`,
+            [userId]
+        );
+        return res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener historial de facturas' });
     }
 });
 

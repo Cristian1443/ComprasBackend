@@ -552,6 +552,20 @@ app.get('/api/solicitudes/:id', async (req, res) => {
             solicitud.total_invitaciones = 0;
         }
 
+        // 7. Número de acta del Comité — vive en actas_comite (solicitudes_ids), no en la tabla solicitudes
+        try {
+            const actaResult = await pool.query(
+                `SELECT acta_numero FROM actas_comite WHERE $1::text = ANY(solicitudes_ids) ORDER BY fecha_sesion DESC LIMIT 1`,
+                [id]
+            );
+            solicitud.acta_numero = actaResult.rows[0]?.acta_numero || null;
+        } catch (e) {
+            if (e && e.code !== '42P01') {
+                console.error('Error cargando número de acta:', e);
+            }
+            solicitud.acta_numero = null;
+        }
+
         return res.json(solicitud);
     } catch (err) {
         console.error('Error al obtener detalle:', err);
@@ -2239,6 +2253,44 @@ app.get('/api/gerente/historial', async (req, res) => {
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al obtener historial' });
+    }
+});
+
+// GET /api/gerente/contratos?email=xxx
+// Contratos/solicitudes de la gerencia del gerente (visión de avance, no solo decisión)
+app.get('/api/gerente/contratos', async (req, res) => {
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ error: 'email requerido' });
+    try {
+        const userRes = await pool.query('SELECT gerencia_id FROM usuarios WHERE email = $1', [email]);
+        if (userRes.rows.length === 0) return res.status(404).json({ error: 'Gerente no encontrado' });
+        const gerenciaId = userRes.rows[0].gerencia_id;
+
+        const result = await pool.query(
+            `SELECT s.id, s.codigo, s.objeto, s.titulo_contrato, s.estado, s.moneda, s.valor_en_cop, s.valor_estimado,
+                    s.valor_moneda_cop_texto, s.valor_moneda_usd_texto, s.valor_moneda_eur_texto,
+                    s.plazo_ejecucion_meses, s.plazo_ejecucion_dias, s.creado_en,
+                    u_sol.nombre AS solicitante_nombre,
+                    (SELECT p.nombre_proveedor FROM proponentes p
+                     WHERE p.solicitud_id = s.id ORDER BY p.seleccionado DESC NULLS LAST, p.numero ASC LIMIT 1) AS proveedor_nombre,
+                    COALESCE(SUM(CASE WHEN fc.pagado_financiera = true THEN fc.valor ELSE 0 END), 0)::numeric AS total_facturado,
+                    COUNT(CASE WHEN fc.pagado_financiera = true THEN 1 END)::int AS facturas_aprobadas,
+                    COUNT(fc.id)::int AS total_facturas
+             FROM solicitudes s
+             JOIN usuarios u_sol ON s.solicitante_id = u_sol.id
+             LEFT JOIN facturas_contrato fc ON fc.solicitud_id = s.id
+             WHERE s.gerencia_id = $1
+               AND s.estado != 'borrador'
+             GROUP BY s.id, s.codigo, s.objeto, s.titulo_contrato, s.estado, s.moneda, s.valor_en_cop, s.valor_estimado,
+                      s.valor_moneda_cop_texto, s.valor_moneda_usd_texto, s.valor_moneda_eur_texto,
+                      s.plazo_ejecucion_meses, s.plazo_ejecucion_dias, s.creado_en, u_sol.nombre
+             ORDER BY s.actualizado_en DESC`,
+            [gerenciaId]
+        );
+        return res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener contratos de la gerencia' });
     }
 });
 

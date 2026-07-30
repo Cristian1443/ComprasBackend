@@ -35,7 +35,9 @@ import {
     generarPdfFormatoPlaneacion,
     generarPdfActaComite,
     generarPdfActaComiteMultiple,
+    generarPdfEvaluacionProveedor,
 } from '../services/pdfGenerator.js';
+import { subirArchivoContrato, obtenerEstadoConexion as obtenerEstadoConexionGraph } from '../services/graphAppService.js';
 
 const ETAPAS_VALIDAS = ['gerente', 'financiera', 'comite', 'juridica', 'proveedor'];
 /** Etapas que ya no usan Adobe Sign; la aprobación queda con estampa de tiempo. */
@@ -195,6 +197,28 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                     });
                 }
             }
+        } else if (etapa === 'proveedor') {
+            // Firma el supervisor designado del contrato (RA1-5 Evaluación de Proveedores)
+            if (solicitud.supervision_email) {
+                out.push({
+                    rol_firma: 'proveedor',
+                    nombre: solicitud.supervision_nombre || solicitud.supervision_email,
+                    email: solicitud.supervision_email,
+                    cargo: 'Supervisor del Contrato',
+                    orden: 1,
+                });
+            } else if (solicitud.supervision_id) {
+                const r = await pool.query(`SELECT nombre, email, cargo FROM usuarios WHERE id = $1`, [solicitud.supervision_id]);
+                if (r.rows[0]) {
+                    out.push({
+                        rol_firma: 'proveedor',
+                        nombre: r.rows[0].nombre,
+                        email: r.rows[0].email,
+                        cargo: r.rows[0].cargo || 'Supervisor del Contrato',
+                        orden: 1,
+                    });
+                }
+            }
         }
         return out;
     }
@@ -206,7 +230,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             financiera: 'formato_planeacion',
             juridica: 'visto_bueno_juridica',
             comite: 'acta_comite',
-            proveedor: 'contrato',
+            proveedor: 'evaluacion_proveedor',
         }[etapa] || 'formato_planeacion';
     }
 
@@ -271,9 +295,20 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             }
 
             if (firmantes.length === 0) {
-                return res.status(400).json({
-                    error: `No se encontraron firmantes para la etapa "${etapa}". Verifica la configuración.`,
-                });
+                const mensajeFirmante = etapa === 'proveedor'
+                    ? 'No se encontró el supervisor designado para este contrato. Asigna un supervisor antes de enviar a firma.'
+                    : `No se encontraron firmantes para la etapa "${etapa}". Verifica la configuración.`;
+                return res.status(400).json({ error: mensajeFirmante });
+            }
+
+            // Evaluación del proveedor (requerida para la etapa "proveedor")
+            let evaluacion = null;
+            if (etapa === 'proveedor') {
+                const evalRes = await pool.query(`SELECT * FROM evaluaciones_proveedor WHERE solicitud_id = $1`, [id]);
+                evaluacion = evalRes.rows[0] || null;
+                if (!evaluacion) {
+                    return res.status(400).json({ error: 'Debes guardar la calificación antes de enviarla a firma.' });
+                }
             }
 
             // Generar PDF
@@ -282,7 +317,9 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             const nombreArchivo = `${etapa}_${Date.now()}.pdf`;
             const pdfPath = path.join(carpetaSolicitud, nombreArchivo);
 
-            if (etapa === 'comite') {
+            if (etapa === 'proveedor') {
+                await generarPdfEvaluacionProveedor({ solicitud, evaluacion, destinoPath: pdfPath });
+            } else if (etapa === 'comite') {
                 const numActa = actaNumero || `Sesión ${formatearFechaCorta(new Date())}`;
                 const fechaActa = fechaSesion || new Date().toISOString();
                 const participantesActa = participantes || [];
@@ -317,6 +354,8 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
 
             const titulo = etapa === 'comite'
                 ? `Acta Comité - ${solicitud.codigo}`
+                : etapa === 'proveedor'
+                ? `Evaluación de Proveedor - ${solicitud.codigo}`
                 : `Aprobación ${etapa} - ${solicitud.codigo}`;
 
             // Crear acuerdo en Adobe
@@ -518,6 +557,56 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
         } catch (err) {
             console.error('[firmas] Error guardando config adobe:', err);
             res.status(500).json({ error: 'Error guardando configuración' });
+        }
+    });
+
+    // ============================================================
+    // Configuración Microsoft Graph (App Registration para subir
+    // archivos a SharePoint automáticamente, sin sesión de usuario)
+    // ============================================================
+    router.get('/configuracion/graph-app', async (_req, res) => {
+        try {
+            const r = await pool.query(`SELECT id, tenant_id, site_search, drive_name, parent_path, modo, actualizado_en,
+                                        (client_id IS NOT NULL AND client_id <> '') AS tiene_client_id,
+                                        (client_secret IS NOT NULL AND client_secret <> '') AS tiene_client_secret
+                                        FROM configuracion_graph_app WHERE id = 1`);
+            res.json(r.rows[0] || {});
+        } catch (err) {
+            res.status(500).json({ error: 'Error' });
+        }
+    });
+
+    router.put('/configuracion/graph-app', async (req, res) => {
+        const { tenant_id, client_id, client_secret, site_search, drive_name, parent_path, modo } = req.body || {};
+        try {
+            await pool.query(
+                `UPDATE configuracion_graph_app
+                    SET tenant_id      = COALESCE($1, tenant_id),
+                        client_id      = COALESCE($2, client_id),
+                        client_secret  = COALESCE($3, client_secret),
+                        site_search    = COALESCE($4, site_search),
+                        drive_name     = COALESCE($5, drive_name),
+                        parent_path    = COALESCE($6, parent_path),
+                        modo           = COALESCE($7, modo),
+                        access_token   = NULL,
+                        access_expira_en = NULL,
+                        actualizado_en = NOW()
+                  WHERE id = 1`,
+                [tenant_id, client_id, client_secret, site_search, drive_name, parent_path, modo]
+            );
+            res.json({ ok: true });
+        } catch (err) {
+            console.error('[firmas] Error guardando config graph-app:', err);
+            res.status(500).json({ error: 'Error guardando configuración' });
+        }
+    });
+
+    router.get('/graph-app/status', async (_req, res) => {
+        try {
+            const estado = await obtenerEstadoConexionGraph(pool);
+            res.json(estado);
+        } catch (err) {
+            res.json({ configured: false, modo: 'mock' });
         }
     });
 
@@ -822,6 +911,34 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
         }
     });
 
+    // ============================================================
+    // CRON: reintento cada 5 min de post-procesamiento "proveedor"
+    // (subida a SharePoint + finalización) por si el primer intento
+    // falló — p.ej. Graph caído momentáneamente.
+    // ============================================================
+    cron.schedule('*/5 * * * *', async () => {
+        try {
+            const r = await pool.query(
+                `SELECT fd.id
+                   FROM firmas_documento fd
+                   JOIN evaluaciones_proveedor ep ON ep.solicitud_id = fd.solicitud_id
+                  WHERE fd.etapa = 'proveedor'
+                    AND fd.estado = 'firmado'
+                    AND ep.sharepoint_subido_en IS NULL
+                  LIMIT 20`
+            );
+            for (const row of r.rows) {
+                try {
+                    await procesarFirmaProveedorCompletada(pool, row.id);
+                } catch (e) {
+                    console.warn('[firmas:cron-proveedor] error en', row.id, e.message);
+                }
+            }
+        } catch (e) {
+            console.warn('[firmas:cron-proveedor] fallo de polling:', e.message);
+        }
+    });
+
     console.log('[firmas] Rutas registradas y cron de polling activo (60s)');
 }
 
@@ -860,6 +977,19 @@ async function sincronizarFirma(pool, firma, firmasDir) {
         );
     }
 
+    // El endpoint /members de Adobe Sign devuelve estados de participante
+    // (p.ej. "ACTIVE") que no siempre coinciden con los valores anteriores,
+    // así que si el acuerdo completo ya quedó firmado, es autoritativo:
+    // todos los firmantes (no rechazados) quedan como 'firmado'.
+    if (info.firmado) {
+        await pool.query(
+            `UPDATE firmantes_documento
+                SET estado = 'firmado', firmado_en = COALESCE(firmado_en, NOW())
+              WHERE firma_id = $1 AND estado NOT IN ('firmado', 'rechazado')`,
+            [firma.id]
+        );
+    }
+
     // Si está firmado, descargar PDF firmado
     if (info.firmado && !firma.pdf_firmado_path) {
         try {
@@ -876,7 +1006,85 @@ async function sincronizarFirma(pool, firma, firmasDir) {
         }
     }
 
+    // Etapa "proveedor" (RA1-5): al quedar firmado el supervisor, subir el PDF
+    // a SharePoint (03.Postcontractual) y finalizar el contrato automáticamente.
+    if (info.firmado && firma.etapa === 'proveedor') {
+        try {
+            await procesarFirmaProveedorCompletada(pool, firma.id);
+        } catch (e) {
+            console.warn('[firmas] Error post-procesando evaluación de proveedor:', e.message);
+        }
+    }
+
     return { estado: info.estadoInterno, estadoAdobe: info.estadoAdobe, firmantes: info.firmantes };
+}
+
+// ============================================================
+// Post-procesamiento de la etapa "proveedor" (RA1-5) una vez firmada:
+//  1. Sube el PDF firmado a SharePoint → 03.Postcontractual
+//  2. Marca la evaluación como subida (idempotente)
+//  3. Finaliza el contrato (estado = 'finalizado')
+// Se reintenta solo (vía cron) si algún paso falla, gracias al
+// chequeo de sharepoint_subido_en IS NULL.
+// ============================================================
+async function procesarFirmaProveedorCompletada(pool, firmaId) {
+    const firmaRes = await pool.query(`SELECT * FROM firmas_documento WHERE id = $1`, [firmaId]);
+    const firma = firmaRes.rows[0];
+    if (!firma || firma.estado !== 'firmado' || !firma.pdf_firmado_path) return;
+
+    const evalRes = await pool.query(`SELECT * FROM evaluaciones_proveedor WHERE solicitud_id = $1`, [firma.solicitud_id]);
+    const evaluacion = evalRes.rows[0];
+    if (!evaluacion) return;
+
+    // Idempotente para subidas reales, pero si quedó marcada con una URL
+    // "mock://" (procesada mientras la config estaba en modo prueba), se
+    // reintenta: así, apenas el admin configure las credenciales reales y
+    // pase a "producción", el archivo se termina subiendo de verdad sin
+    // intervención manual.
+    const yaSubidoDeVerdad = evaluacion.sharepoint_subido_en && !String(evaluacion.sharepoint_url || '').startsWith('mock://');
+    if (yaSubidoDeVerdad) return;
+
+    const solRes = await pool.query(`SELECT codigo FROM solicitudes WHERE id = $1`, [firma.solicitud_id]);
+    const codigo = solRes.rows[0]?.codigo;
+    if (!codigo) return;
+
+    const nombreArchivo = `Evaluacion_Proveedor_${codigo}.pdf`;
+    const subida = await subirArchivoContrato({
+        pool,
+        codigoContrato: codigo,
+        subcarpeta: '03.Postcontractual',
+        nombreArchivo,
+        filePath: firma.pdf_firmado_path,
+    });
+
+    await pool.query(
+        `UPDATE evaluaciones_proveedor
+            SET firma_id = $1, sharepoint_url = $2, sharepoint_subido_en = NOW(), contrato_finalizado_en = NOW()
+          WHERE solicitud_id = $3`,
+        [firma.id, subida.webUrl || null, firma.solicitud_id]
+    );
+
+    // El supervisor puede tener contratos asignados en distintos estados
+    // (aprobado_juridica, en_financiera, aprobado_financiera, contratado, ...)
+    // según la modalidad y en qué punto vaya la aprobación financiera/jurídica.
+    // Su firma de la evaluación es la señal autoritativa de que el contrato
+    // terminó de ejecutarse, así que se finaliza desde cualquier estado activo.
+    const finalizado = await pool.query(
+        `UPDATE solicitudes
+            SET estado = 'finalizado',
+                fecha_fin_contrato = COALESCE(fecha_fin_contrato, NOW()::date),
+                actualizado_en = NOW()
+          WHERE id = $1
+            AND estado NOT IN ('finalizado', 'cerrado', 'cancelado', 'borrador')
+          RETURNING id`,
+        [firma.solicitud_id]
+    );
+
+    if (finalizado.rows.length === 0) {
+        console.warn(`[firmas] Contrato ${codigo} no se finalizó (estado ya era 'finalizado'/'cerrado'/'cancelado'/'borrador').`);
+    }
+
+    console.log(`[firmas] Evaluación de proveedor de ${codigo} subida a SharePoint (${subida.modo}) y contrato finalizado.`);
 }
 
 function formatearFechaCorta(d) {

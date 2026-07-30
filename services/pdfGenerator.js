@@ -190,6 +190,230 @@ export function generarPdfActaComite({ solicitud, actaNumero, fechaSesion, parti
     });
 }
 
+const COLOR_ROJO_RA15 = '#D0312D';
+const COLOR_AMBAR_RA15 = '#F5A623';
+
+/**
+ * Genera el PDF "RA1-5 Evaluación de Proveedores" con la calificación
+ * capturada por el supervisor, listo para enviar a Adobe Sign (el
+ * supervisor del contrato firma el documento).
+ *
+ * @param {object} opts
+ * @param {object} opts.solicitud - Fila de v_solicitudes_resumen (incluye titulo_contrato, supervision_nombre)
+ * @param {object} opts.evaluacion - Fila de evaluaciones_proveedor (criterios, total, observaciones, etc.)
+ * @param {string} opts.destinoPath
+ */
+export function generarPdfEvaluacionProveedor({ solicitud, evaluacion, destinoPath }) {
+    return new Promise((resolve, reject) => {
+        try {
+            fs.mkdirSync(path.dirname(destinoPath), { recursive: true });
+            const doc = new PDFDocument({ size: 'A4', margin: 40, info: {
+                Title: `RA1-5 Evaluación de Proveedores - ${solicitud.codigo}`,
+                Author: 'Invest in Bogotá',
+                Subject: 'Evaluación de Proveedores',
+            }});
+            const stream = fs.createWriteStream(destinoPath);
+            doc.pipe(stream);
+
+            const X = 40, ANCHO = 515; // 595.28pt (A4) - 2*40 de margen
+
+            // ───── 1. Cabecera: título + logo (igual que el formulario web) ─────
+            const leftW = 350, rightW = ANCHO - leftW, headerH = 58;
+            const headerY = doc.y;
+            doc.lineWidth(1.5).strokeColor('#999999');
+            doc.rect(X, headerY, leftW, headerH).stroke();
+            doc.rect(X + leftW, headerY, rightW, headerH).stroke();
+
+            doc.fillColor('#1f2937').fontSize(13).font('Helvetica-Bold')
+                .text('RA1-5 EVALUACIÓN DE', X + 14, headerY + 12, { width: leftW - 28 });
+            doc.text('PROVEEDORES', X + 14, headerY + 28, { width: leftW - 28 });
+
+            const grupoW = 116, grupoX = X + leftW + (rightW - grupoW) / 2, circleR = 20;
+            const circleCx = grupoX + 76, circleCy = headerY + headerH / 2;
+            doc.fillColor('#333333').fontSize(9).font('Helvetica')
+                .text('Invest in', grupoX, circleCy - 5, { width: 70 });
+            doc.fillColor(COLOR_ROJO_RA15).circle(circleCx, circleCy, circleR).fill();
+            doc.fillColor('#fff').fontSize(7.5).font('Helvetica-Bold')
+                .text('Bogotá', circleCx - circleR, circleCy - 4, { width: circleR * 2, align: 'center' });
+
+            doc.y = headerY + headerH + 12;
+            doc.fillColor(COLOR_GRIS_CLARO).fontSize(9).font('Helvetica')
+                .text(`Invest in Bogotá · ${solicitud.codigo || 'Sin código'}`, X, doc.y);
+            doc.moveDown(0.8);
+
+            // ───── 2. Datos del contrato ─────
+            let y = doc.y;
+            y = filaTabla(doc, {
+                x: X, y, labelW: 206, valueW: ANCHO - 206,
+                label: 'Título de la contratación:', value: solicitud.titulo_contrato || solicitud.objeto || '—',
+                labelBg: COLOR_ROJO_RA15, labelColor: '#fff', valueColor: COLOR_GRIS,
+            });
+            y = filaTabla(doc, {
+                x: X, y, labelW: 206, valueW: ANCHO - 206,
+                label: 'Tipo de contratación:', value: String(solicitud.modalidad || '—').toUpperCase(),
+                labelBg: COLOR_ROJO_RA15, labelColor: '#fff', valueColor: COLOR_GRIS,
+            });
+            y = filaTabla(doc, {
+                x: X, y, labelW: 206, valueW: ANCHO - 206,
+                label: 'Proveedor:', value: evaluacion.nombre_proveedor || '—',
+                labelBg: COLOR_ROJO_RA15, labelColor: '#fff', valueColor: COLOR_GRIS,
+            });
+            y = filaTabla(doc, {
+                x: X, y, labelW: 206, valueW: ANCHO - 206,
+                label: 'No. de contrato u orden asociado:', value: solicitud.codigo || '—',
+                labelBg: COLOR_ROJO_RA15, labelColor: '#fff', valueColor: COLOR_GRIS,
+            });
+            y = filaTabla(doc, {
+                x: X, y, labelW: 206, valueW: ANCHO - 206,
+                label: 'Correo electrónico del proveedor:', value: evaluacion.correo_proveedor || '—',
+                labelBg: COLOR_ROJO_RA15, labelColor: '#fff', valueColor: COLOR_GRIS,
+            });
+            y = filaTabla(doc, {
+                x: X, y, labelW: 206, valueW: ANCHO - 206,
+                label: 'Fecha de evaluación:', value: formatearFecha(evaluacion.fecha_evaluacion),
+                labelBg: COLOR_ROJO_RA15, labelColor: '#fff', valueColor: COLOR_GRIS,
+            });
+            y += 10;
+
+            // ───── 3. Banner "Calificación" + instrucciones ─────
+            const bannerH = 20;
+            doc.rect(X, y, ANCHO, bannerH).fillAndStroke(COLOR_ROJO_RA15, '#fff');
+            doc.fillColor('#fff').fontSize(11).font('Helvetica-Bold')
+                .text('CALIFICACIÓN', X, y + 5, { width: ANCHO, align: 'center' });
+            y += bannerH;
+
+            const instruccion = 'Evalúe de uno a diez donde uno es muy insatisfecho y diez muy satisfecho';
+            doc.fontSize(9).font('Helvetica');
+            const instruccionH = doc.heightOfString(instruccion, { width: ANCHO - 20, align: 'center' }) + 14;
+            doc.rect(X, y, ANCHO, instruccionH).strokeColor('#ccc').lineWidth(0.5).stroke();
+            doc.fillColor(COLOR_GRIS)
+                .text(instruccion, X + 10, y + 7, { width: ANCHO - 20, align: 'center' });
+            y += instruccionH + 6;
+
+            // ───── 4. Tabla de criterios ─────
+            const criterios = Array.isArray(evaluacion.criterios) ? evaluacion.criterios : [];
+            const colW1 = 380, colW2 = ANCHO - colW1, filaPad = 7;
+
+            // Encabezado tabla
+            doc.rect(X, y, colW1, 22).fillAndStroke(COLOR_ROJO_RA15, '#fff');
+            doc.rect(X + colW1, y, colW2, 22).fillAndStroke(COLOR_ROJO_RA15, '#fff');
+            doc.fillColor('#fff').fontSize(9).font('Helvetica-Bold')
+                .text('Aspectos para evaluar', X + 8, y + 7, { width: colW1 - 16 });
+            doc.text('Puntaje obtenido', X + colW1, y + 7, { width: colW2, align: 'center' });
+            y += 22;
+
+            criterios.forEach((c) => {
+                const nombre = c.nombre || '—';
+                doc.fontSize(9).font('Helvetica');
+                const textoH = doc.heightOfString(nombre, { width: colW1 - 16 });
+                const rowH = Math.max(22, textoH + filaPad * 2);
+
+                doc.rect(X, y, colW1, rowH).strokeColor('#ccc').lineWidth(0.5).stroke();
+                doc.rect(X + colW1, y, colW2, rowH).strokeColor('#ccc').lineWidth(0.5).stroke();
+                doc.fillColor(COLOR_GRIS).font('Helvetica')
+                    .text(nombre, X + 8, y + filaPad, { width: colW1 - 16 });
+                doc.font('Helvetica-Bold')
+                    .text(String(c.puntaje ?? '0'), X + colW1, y + filaPad, { width: colW2, align: 'center' });
+                y += rowH;
+            });
+
+            // Fila total
+            doc.rect(X, y, colW1, 24).fillAndStroke(COLOR_ROJO_RA15, '#fff');
+            doc.rect(X + colW1, y, colW2, 24).fillAndStroke(COLOR_AMBAR_RA15, '#fff');
+            doc.fillColor('#fff').fontSize(9).font('Helvetica-Bold')
+                .text('Resultado ponderado máximo 100', X + 8, y + 8, { width: colW1 - 16 });
+            doc.fontSize(11)
+                .text(Number(evaluacion.total || 0).toFixed(2), X + colW1, y + 7, { width: colW2, align: 'center' });
+            y += 24 + 10;
+
+            // ───── 5. Estado del proveedor ─────
+            const total = Number(evaluacion.total || 0);
+            const estado = total >= 80 ? 'Proveedor aprobado'
+                : total >= 70 ? 'Proveedor en observación'
+                : 'Proveedor rechazado — bloqueado para futuros contratos';
+            const estadoColor = total >= 80 ? '#15803d' : total >= 70 ? '#b45309' : '#b91c1c';
+            y = filaTabla(doc, {
+                x: X, y, labelW: 180, valueW: ANCHO - 180,
+                label: 'Estado:', value: estado,
+                labelBg: COLOR_AMBAR_RA15, labelColor: '#fff', valueColor: estadoColor, valueBold: true,
+            });
+            y += 10;
+
+            // ───── 6. Observaciones ─────
+            doc.rect(X, y, ANCHO, bannerH).fillAndStroke(COLOR_ROJO_RA15, '#fff');
+            doc.fillColor('#fff').fontSize(11).font('Helvetica-Bold')
+                .text('OBSERVACIONES', X, y + 5, { width: ANCHO, align: 'center' });
+            y += bannerH;
+
+            const obsTexto = evaluacion.observaciones || 'Sin observaciones adicionales.';
+            doc.fontSize(10).font('Helvetica');
+            const obsH = Math.max(50, doc.heightOfString(obsTexto, { width: ANCHO - 20 }) + 16);
+            doc.rect(X, y, ANCHO, obsH).strokeColor('#ccc').lineWidth(0.5).stroke();
+            doc.fillColor(COLOR_GRIS).text(obsTexto, X + 10, y + 8, { width: ANCHO - 20, align: 'justify' });
+            y += obsH + 20;
+
+            doc.y = y;
+            if (doc.y > doc.page.height - 175) doc.addPage();
+
+            // ───── 7. Firma electrónica del supervisor ─────
+            doc.fillColor(COLOR_GRIS).fontSize(11).font('Helvetica-Bold').text('FIRMA DEL SUPERVISOR DESIGNADO', X, doc.y);
+            doc.moveDown(0.3);
+            doc.fillColor(COLOR_GRIS).fontSize(10).font('Helvetica')
+                .text('El supervisor del contrato certifica la evaluación realizada al proveedor. Se firma electrónicamente.', X, doc.y, {
+                    width: ANCHO, align: 'justify',
+                });
+            doc.moveDown(1.5);
+
+            // Fuente grande en el tag para que Adobe Sign dimensione un
+            // campo de firma más grande, y más espacio vertical antes de
+            // la línea para que el trazo de la firma no quede apretado.
+            const ySig = doc.y;
+            doc.fontSize(24).fillColor('#000000').font('Helvetica').text('{{Sig_es_:signer1:signature}}', 60, ySig);
+            doc.moveTo(60, ySig + 60).lineTo(400, ySig + 60).strokeColor('#000').lineWidth(0.5).stroke();
+            doc.fontSize(9).fillColor(COLOR_GRIS_CLARO).text('Firma electrónica', 60, ySig + 66, { width: 340 });
+            doc.fillColor(COLOR_GRIS).fontSize(10).font('Helvetica-Bold')
+                .text(solicitud.supervision_nombre || 'Supervisor designado', 60, ySig + 79, { width: 340 });
+            doc.fontSize(9).fillColor(COLOR_GRIS_CLARO).font('Helvetica').text('Supervisor del contrato', 60, ySig + 93, { width: 340 });
+
+            // Pie
+            doc.fontSize(8).fillColor(COLOR_GRIS_CLARO)
+                .text(`RA1-5 · Generado el ${formatearFechaHora(new Date())}`,
+                    40, doc.page.height - 50, { align: 'center', width: 515 });
+
+            doc.end();
+            stream.on('finish', () => resolve(destinoPath));
+            stream.on('error', reject);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+/**
+ * Dibuja una fila de dos celdas (label coloreado + valor) con altura
+ * calculada dinámicamente según el texto más alto de las dos celdas,
+ * para evitar solapamientos cuando el label o el valor se parten en
+ * varias líneas. Devuelve el nuevo valor de `y` tras la fila.
+ */
+function filaTabla(doc, { x, y, labelW, valueW, label, value, labelBg, labelColor, valueColor, valueBold, fontSize = 9 }) {
+    const pad = 8;
+    doc.font('Helvetica-Bold').fontSize(fontSize);
+    const labelH = doc.heightOfString(label, { width: labelW - pad * 2, align: 'center' });
+    doc.font(valueBold ? 'Helvetica-Bold' : 'Helvetica').fontSize(fontSize);
+    const valueH = doc.heightOfString(String(value ?? '—') || '—', { width: valueW - pad * 2 });
+    const rowH = Math.max(labelH, valueH) + pad * 2;
+
+    doc.rect(x, y, labelW, rowH).fillAndStroke(labelBg, '#fff');
+    doc.rect(x + labelW, y, valueW, rowH).strokeColor('#ccc').lineWidth(0.5).stroke();
+
+    doc.fillColor(labelColor).font('Helvetica-Bold').fontSize(fontSize)
+        .text(label, x + pad, y + pad, { width: labelW - pad * 2, align: 'center' });
+    doc.fillColor(valueColor).font(valueBold ? 'Helvetica-Bold' : 'Helvetica').fontSize(fontSize)
+        .text(String(value ?? '—') || '—', x + labelW + pad, y + pad, { width: valueW - pad * 2 });
+
+    return y + rowH;
+}
+
 // ============================================================
 // Helpers de layout
 // ============================================================
@@ -437,4 +661,5 @@ export default {
     generarPdfFormatoPlaneacion,
     generarPdfActaComite,
     generarPdfActaComiteMultiple,
+    generarPdfEvaluacionProveedor,
 };

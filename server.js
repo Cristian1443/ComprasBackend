@@ -30,6 +30,10 @@ const JURIDICA_UPLOADS_DIR = path.join(__dirname, 'uploads', 'juridica');
 fs.mkdirSync(JURIDICA_UPLOADS_DIR, { recursive: true });
 const FACTURAS_UPLOADS_DIR = path.join(__dirname, 'uploads', 'facturas');
 fs.mkdirSync(FACTURAS_UPLOADS_DIR, { recursive: true });
+const RECONOCIMIENTOS_UPLOADS_DIR = path.join(__dirname, 'uploads', 'reconocimientos');
+fs.mkdirSync(RECONOCIMIENTOS_UPLOADS_DIR, { recursive: true });
+const PROVEEDORES_UPLOADS_DIR = path.join(__dirname, 'uploads', 'proveedores');
+fs.mkdirSync(PROVEEDORES_UPLOADS_DIR, { recursive: true });
 
 // Configurar multer para guardar archivos
 const storage = multer.diskStorage({
@@ -90,6 +94,34 @@ const uploadJuridica = multer({
         else cb(new Error(`Tipo de archivo no permitido: .${ext}`));
     }
 });
+
+// Documentos legales/tributarios adjuntos al registro público de proveedor (RA1-4)
+const proveedoresStorage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, PROVEEDORES_UPLOADS_DIR),
+    filename: (_req, file, cb) => {
+        const unique = Date.now() + '-' + Math.round(Math.random() * 1e6);
+        const ext = path.extname(file.originalname);
+        cb(null, `${unique}${ext}`);
+    }
+});
+const uploadProveedores = multer({
+    storage: proveedoresStorage,
+    limits: { fileSize: 20 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+        const allowed = /pdf|png|jpg|jpeg/i;
+        const ext = path.extname(file.originalname).slice(1);
+        if (allowed.test(ext)) cb(null, true);
+        else cb(new Error(`Tipo de archivo no permitido: .${ext}`));
+    }
+});
+const DOCUMENTOS_PROVEEDOR_CAMPOS = ['rut', 'camara_comercio', 'cedula_rl', 'sarlaft', 'certificacion_bancaria'];
+const DOCUMENTOS_PROVEEDOR_LABELS = {
+    rut: 'RUT',
+    camara_comercio: 'Cámara de comercio',
+    cedula_rl: 'Fotocopia cédula de ciudadanía',
+    sarlaft: 'SARLAFT',
+    certificacion_bancaria: 'Certificación bancaria',
+};
 
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -291,6 +323,17 @@ try {
 function etapaFirmaRequerida(_nuevoEstado) {
     return null;
 }
+
+// Traduce la sigla registrada en `gerencias.nombre` al nombre completo usado en
+// `presupuesto_vigencia.gerencia_nombre` (debe mantenerse sincronizado con
+// GERENCIAS_FINANCIERA en compras-contratacion-frontend/src/components/financiera/PresupuestoVigencia.tsx).
+const GERENCIA_NOMBRE_PRESUPUESTO = {
+    GAF: 'Gerencia Administrativa y Financiera',
+    GAE: 'Gerencia de Apoyo Estrategico',
+    MERCADEO: 'Gerencia de Mercadeo y Comunicaciones',
+    GPDI: 'Gerencia de Promocion e Inversion',
+    BUREAU: 'Gerencia Bureau de Convenciones',
+};
 
 async function firmaCompletaPara(solicitudId, etapa) {
     if (!etapa) return true;
@@ -529,7 +572,7 @@ app.get('/api/solicitudes/:id', async (req, res) => {
         // 5. Anexos (anexos_documentos)
         try {
             const anexosResult = await pool.query(
-                `SELECT nombre_documento, tipo, fecha_documento
+                `SELECT nombre_documento, tipo, fecha_documento, archivo_url, archivo_nombre_original
                  FROM anexos_documentos
                  WHERE solicitud_id = $1
                  ORDER BY fecha_documento NULLS LAST, nombre_documento`,
@@ -596,6 +639,42 @@ app.patch('/api/solicitudes/:id/estado', async (req, res) => {
         }
     }
 
+    // ── BLOQUEO POR PRESUPUESTO: el gerente no puede aprobar (pasar a
+    // en_financiera) si la gerencia solicitante no tiene Disponible Real (>0)
+    // cargado en la vigencia actual.
+    if (estado === 'en_financiera') {
+        const vigenciaActual = new Date().getFullYear();
+        // `gerencias.nombre` guarda la sigla (GAF, GAE, MERCADEO, GPDI, BUREAU) mientras que
+        // `presupuesto_vigencia.gerencia_nombre` guarda el nombre completo (ver GERENCIAS_FINANCIERA
+        // en el frontend). Hay que traducir la sigla antes de buscar el presupuesto cargado.
+        const gerRes = await pool.query(
+            `SELECT g.nombre FROM solicitudes s JOIN gerencias g ON g.id = s.gerencia_id WHERE s.id = $1`,
+            [id]
+        );
+        const siglaGerencia = String(gerRes.rows[0]?.nombre || '').trim().toUpperCase();
+        const gerenciaNombreCompleto = GERENCIA_NOMBRE_PRESUPUESTO[siglaGerencia] || gerRes.rows[0]?.nombre || '';
+        const presRes = await pool.query(
+            `SELECT
+                (pv.monto_total
+                    - pv.comprometido_vigencia_anterior
+                    - COALESCE(SUM(s2.presupuesto_aprobado) FILTER (WHERE s2.estado IN ('aprobado_juridica','finalizado','contratado','cerrado')), 0)
+                    - COALESCE(SUM(s2.presupuesto_aprobado) FILTER (WHERE s2.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica','en_juridica_concepto','en_riesgos','en_comite')), 0)
+                )::bigint AS disponible
+             FROM presupuesto_vigencia pv
+             LEFT JOIN solicitudes s2 ON s2.rubro = pv.gerencia_nombre AND EXTRACT(YEAR FROM s2.actualizado_en) = pv.vigencia
+             WHERE pv.gerencia_nombre = $1 AND pv.vigencia = $2
+             GROUP BY pv.id, pv.monto_total, pv.comprometido_vigencia_anterior`,
+            [gerenciaNombreCompleto, vigenciaActual]
+        );
+        const disponible = presRes.rows.length ? Number(presRes.rows[0].disponible) : 0;
+        if (disponible <= 0) {
+            return res.status(409).json({
+                error: 'presupuesto_insuficiente',
+                mensaje: 'La gerencia solicitante no tiene presupuesto disponible en la vigencia actual. No es posible aprobar esta solicitud.',
+            });
+        }
+    }
+
     try {
         const result = await pool.query(
             `UPDATE solicitudes 
@@ -637,7 +716,7 @@ app.post('/api/solicitudes', async (req, res) => {
         supervision_id, supervisor, entregables, anexos_texto, anexos_solicitante, riesgos, criterios_ambientales_sst, conclusiones_comite,
         analisis_servicios_ofertados, analisis_valor_promedio, analisis_plazo_promedio, analisis_presupuesto_oficial,
         entregable1, entregable2, entregable3,
-        proponentes, anexos
+        proponentes, anexos, porcentaje_anticipo
     } = req.body;
 
     try {
@@ -681,8 +760,9 @@ app.post('/api/solicitudes', async (req, res) => {
         justificacion_anticipo,
         obligaciones_especificas, entregables_detalle,
         fecha_estimada_solicitud, fecha_estimada_recepcion,
+        porcentaje_anticipo,
         estado
-      ) VALUES ($1,$2,$3,$3,$4,$33,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,nullif($23,'')::date,$24,$25,$26,$27,$28,$29,$30,$31,$32,$34,$35,$40,$41,$36,$37,$38,$39,$42,$43,$44,nullif($45,'')::date,nullif($46,'')::date,'borrador')
+      ) VALUES ($1,$2,$3,$3,$4,$33,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,nullif($23,'')::date,$24,$25,$26,$27,$28,$29,$30,$31,$32,$34,$35,$40,$41,$36,$37,$38,$39,$42,$43,$44,nullif($45,'')::date,nullif($46,'')::date,$47,'borrador')
       RETURNING id, codigo, estado, creado_en`,
             [
                 solicitante_id, gerencia_id, justificacion, descripcion_necesidad_detalle, objeto,
@@ -704,7 +784,8 @@ app.post('/api/solicitudes', async (req, res) => {
                 JSON.stringify(req.body.obligaciones_especificas || []),
                 JSON.stringify(req.body.entregables_detalle || []),
                 req.body.fecha_estimada_solicitud || null,
-                req.body.fecha_estimada_recepcion || null
+                req.body.fecha_estimada_recepcion || null,
+                porcentaje_anticipo || null
             ]
         );
 
@@ -762,14 +843,16 @@ app.post('/api/solicitudes', async (req, res) => {
 
                 await pool.query(
                     `INSERT INTO anexos_documentos (
-                        solicitud_id, nombre_documento, tipo, fecha_documento
+                        solicitud_id, nombre_documento, tipo, fecha_documento, archivo_url, archivo_nombre_original
                     )
-                    VALUES ($1,$2,$3,nullif($4,'')::date)`,
+                    VALUES ($1,$2,$3,nullif($4,'')::date,$5,$6)`,
                     [
                         solicitudId,
                         nombreDocumento,
                         a.tipo || null,
                         a.fecha || a.fecha_documento || null,
+                        a.archivoUrl || a.archivo_url || null,
+                        a.archivoNombre || a.archivo_nombre_original || null,
                     ]
                 );
             }
@@ -796,7 +879,7 @@ app.put('/api/solicitudes/:id', async (req, res) => {
         supervision_id, supervisor, entregables, anexos_texto, anexos_solicitante, riesgos, criterios_ambientales_sst, conclusiones_comite,
         analisis_servicios_ofertados, analisis_valor_promedio, analisis_plazo_promedio, analisis_presupuesto_oficial,
         entregable1, entregable2, entregable3,
-        proponentes, anexos
+        proponentes, anexos, porcentaje_anticipo
     } = req.body;
 
     try {
@@ -869,6 +952,7 @@ app.put('/api/solicitudes/:id', async (req, res) => {
                 entregable3 = $40,
                 fecha_estimada_solicitud = nullif($45,'')::date,
                 fecha_estimada_recepcion = nullif($46,'')::date,
+                porcentaje_anticipo = $47,
                 actualizado_en = NOW(),
                 actualizado_por = COALESCE($31, actualizado_por)
             WHERE id = $30
@@ -892,7 +976,8 @@ app.put('/api/solicitudes/:id', async (req, res) => {
                 JSON.stringify(req.body.obligaciones_especificas || []),
                 JSON.stringify(req.body.entregables_detalle || []),
                 req.body.fecha_estimada_solicitud || null,
-                req.body.fecha_estimada_recepcion || null
+                req.body.fecha_estimada_recepcion || null,
+                porcentaje_anticipo || null
             ]
         );
 
@@ -964,14 +1049,16 @@ app.put('/api/solicitudes/:id', async (req, res) => {
 
                 await pool.query(
                     `INSERT INTO anexos_documentos (
-                        solicitud_id, nombre_documento, tipo, fecha_documento
+                        solicitud_id, nombre_documento, tipo, fecha_documento, archivo_url, archivo_nombre_original
                     )
-                    VALUES ($1,$2,$3,nullif($4,'')::date)`,
+                    VALUES ($1,$2,$3,nullif($4,'')::date,$5,$6)`,
                     [
                         id,
                         nombreDocumento,
                         a.tipo || null,
                         a.fecha || a.fecha_documento || null,
+                        a.archivoUrl || a.archivo_url || null,
+                        a.archivoNombre || a.archivo_nombre_original || null,
                     ]
                 );
             }
@@ -1029,7 +1116,9 @@ app.get('/api/supervisor/contratos', async (req, res) => {
                      WHERE p.solicitud_id = s.id ORDER BY p.seleccionado DESC NULLS LAST, p.numero ASC LIMIT 1) AS proveedor_nombre,
                     COALESCE(SUM(CASE WHEN fc.pagado_financiera = true THEN fc.valor ELSE 0 END), 0)::numeric AS total_facturado,
                     COUNT(CASE WHEN fc.pagado_financiera = true THEN 1 END)::int AS facturas_aprobadas,
-                    COUNT(fc.id)::int AS total_facturas
+                    COUNT(fc.id)::int AS total_facturas,
+                    MIN(fc.creado_en) FILTER (WHERE fc.aprobado_supervisor IS NULL AND fc.estado = 'pendiente') AS factura_pendiente_desde,
+                    EXTRACT(DAY FROM NOW() - MIN(fc.creado_en) FILTER (WHERE fc.aprobado_supervisor IS NULL AND fc.estado = 'pendiente'))::int AS dias_accion_pendiente
              FROM solicitudes s
              JOIN usuarios u_sol ON s.solicitante_id = u_sol.id
              LEFT JOIN facturas_contrato fc ON fc.solicitud_id = s.id
@@ -1038,7 +1127,7 @@ app.get('/api/supervisor/contratos', async (req, res) => {
              GROUP BY s.id, s.codigo, s.objeto, s.titulo_contrato, s.estado, s.moneda, s.valor_en_cop, s.valor_estimado,
                       s.valor_moneda_cop_texto, s.valor_moneda_usd_texto, s.valor_moneda_eur_texto,
                       s.plazo_ejecucion_meses, s.plazo_ejecucion_dias, s.creado_en, u_sol.nombre
-             ORDER BY s.actualizado_en DESC`,
+             ORDER BY dias_accion_pendiente DESC NULLS LAST, s.actualizado_en DESC`,
             [userId]
         );
         return res.json(result.rows);
@@ -1047,6 +1136,55 @@ app.get('/api/supervisor/contratos', async (req, res) => {
         return res.status(500).json({ error: 'Error al obtener contratos' });
     }
 });
+
+// Busca el proveedor ganador de un contrato: evaluación jurídica (fuente de verdad) con fallback a proponente seleccionado
+async function obtenerProveedorContrato(solicitudId) {
+    try {
+        const evalJuriRes = await pool.query(
+            `SELECT evaluacion_json->>'ganador_nombre' AS ganador_nombre,
+                    evaluacion_json->>'ganador_email' AS ganador_email,
+                    evaluacion_json->>'proponente_recomendado_numero' AS ganador_numero,
+                    evaluacion_json->>'ganador_cedula_nit' AS ganador_cedula_nit
+             FROM solicitudes_detalle_juridico WHERE solicitud_id = $1 LIMIT 1`,
+            [solicitudId]
+        );
+        const evalJuri = evalJuriRes.rows[0];
+
+        if (evalJuri?.ganador_nombre) {
+            let propRes = await pool.query(
+                `SELECT id, nombre_proveedor, datos_contacto, valor_con_impuestos, moneda
+                 FROM proponentes WHERE solicitud_id = $1
+                 AND LOWER(TRIM(nombre_proveedor)) = LOWER(TRIM($2)) LIMIT 1`,
+                [solicitudId, evalJuri.ganador_nombre]
+            );
+            if (propRes.rows.length === 0 && evalJuri.ganador_numero != null) {
+                propRes = await pool.query(
+                    `SELECT id, nombre_proveedor, datos_contacto, valor_con_impuestos, moneda
+                     FROM proponentes WHERE solicitud_id = $1 AND numero = $2 LIMIT 1`,
+                    [solicitudId, Number(evalJuri.ganador_numero)]
+                );
+            }
+            if (propRes.rows.length > 0) return propRes.rows[0];
+            return {
+                id: null,
+                nombre_proveedor: evalJuri.ganador_nombre,
+                datos_contacto: evalJuri.ganador_email || null,
+                valor_con_impuestos: null,
+                moneda: 'COP'
+            };
+        }
+
+        const propRes = await pool.query(
+            `SELECT id, nombre_proveedor, datos_contacto, valor_con_impuestos, moneda
+             FROM proponentes WHERE solicitud_id = $1 ORDER BY seleccionado DESC NULLS LAST, numero ASC LIMIT 1`,
+            [solicitudId]
+        );
+        return propRes.rows[0] || null;
+    } catch (e) {
+        console.error('Error buscando proveedor del contrato:', e.message);
+        return null;
+    }
+}
 
 // GET /api/supervisor/contratos/:id
 // Detalle de contrato para supervisor (proveedor, valor, objeto, plazo)
@@ -1074,65 +1212,7 @@ app.get('/api/supervisor/contratos/:id', async (req, res) => {
 
         // Buscar el proveedor ganador usando la evaluación jurídica como fuente de verdad
         const contrato = solRes.rows[0];
-        try {
-            const evalJuriRes = await pool.query(
-                `SELECT evaluacion_json->>'ganador_nombre' AS ganador_nombre,
-                        evaluacion_json->>'ganador_email' AS ganador_email,
-                        evaluacion_json->>'proponente_recomendado_numero' AS ganador_numero,
-                        evaluacion_json->>'ganador_cedula_nit' AS ganador_cedula_nit
-                 FROM solicitudes_detalle_juridico WHERE solicitud_id = $1 LIMIT 1`,
-                [id]
-            );
-            const evalJuri = evalJuriRes.rows[0];
-            console.log('[DEBUG supervisor contrato] evalJuri para', id, ':', JSON.stringify(evalJuri));
-
-            if (evalJuri?.ganador_nombre) {
-                // Intentar encontrar en proponentes por nombre (case-insensitive)
-                let propRes = await pool.query(
-                    `SELECT id, nombre_proveedor, datos_contacto, valor_con_impuestos, moneda
-                     FROM proponentes WHERE solicitud_id = $1
-                     AND LOWER(TRIM(nombre_proveedor)) = LOWER(TRIM($2)) LIMIT 1`,
-                    [id, evalJuri.ganador_nombre]
-                );
-                // Si tampoco encontró por nombre, intentar por numero
-                if (propRes.rows.length === 0 && evalJuri.ganador_numero != null) {
-                    propRes = await pool.query(
-                        `SELECT id, nombre_proveedor, datos_contacto, valor_con_impuestos, moneda
-                         FROM proponentes WHERE solicitud_id = $1 AND numero = $2 LIMIT 1`,
-                        [id, Number(evalJuri.ganador_numero)]
-                    );
-                }
-                if (propRes.rows.length > 0) {
-                    contrato.proveedor = propRes.rows[0];
-                } else {
-                    // El ganador existe en evaluacion_json pero no en tabla proponentes
-                    // (puede ser un respondente de convocatoria) — construir objeto con lo que tenemos
-                    contrato.proveedor = {
-                        id: null,
-                        nombre_proveedor: evalJuri.ganador_nombre,
-                        datos_contacto: evalJuri.ganador_email || null,
-                        valor_con_impuestos: null,
-                        moneda: 'COP'
-                    };
-                }
-            } else {
-                // Sin ganador_nombre → fallback a seleccionado
-                const propRes = await pool.query(
-                    `SELECT id, nombre_proveedor, datos_contacto, valor_con_impuestos, moneda
-                     FROM proponentes WHERE solicitud_id = $1 ORDER BY seleccionado DESC NULLS LAST, numero ASC LIMIT 1`,
-                    [id]
-                );
-                contrato.proveedor = propRes.rows[0] || null;
-            }
-        } catch (e) {
-            console.error('Error buscando ganador en evaluacion_json:', e.message);
-            const propRes = await pool.query(
-                `SELECT id, nombre_proveedor, datos_contacto, valor_con_impuestos, moneda
-                 FROM proponentes WHERE solicitud_id = $1 ORDER BY seleccionado DESC NULLS LAST, numero ASC LIMIT 1`,
-                [id]
-            );
-            contrato.proveedor = propRes.rows[0] || null;
-        }
+        contrato.proveedor = await obtenerProveedorContrato(id);
 
         // Evaluación existente
         try {
@@ -1607,7 +1687,7 @@ app.put('/api/solicitudes/:id/enviar', async (req, res) => {
                  fecha_envio_gerente = NOW(),
                  actualizado_en = NOW()
              WHERE id = $1
-               AND estado IN ('borrador', 'rechazado_gerente', 'devuelto_al_solicitante', 'rechazado_financiera', 'rechazado_juridica', 'rechazado_comite')
+               AND estado IN ('borrador', 'rechazado_gerente', 'devuelto_al_solicitante', 'rechazado_financiera', 'rechazado_juridica', 'rechazado_comite', 'rechazado_riesgos')
              RETURNING id, codigo, estado`,
             [id]
         );
@@ -1686,12 +1766,13 @@ app.post('/api/solicitudes/:id/aprobar-financiera', async (req, res) => {
     if (aprobar === undefined) return res.status(400).json({ error: 'aprobar es requerido' });
 
     try {
-        // Invitación a ofertar va directo a jurídica; Directa y TDR pasan por comité.
+        // Directa, TDR e Invitación pasan primero por Jurídica solo para el concepto
+        // jurídico (7.1-7.3), y de ahí a Riesgos/Comité antes de que Jurídica retome
+        // el resto del proceso.
         const result = await pool.query(
             `UPDATE solicitudes
              SET estado = CASE
-                     WHEN $1::boolean = true AND LOWER(modalidad::text) LIKE 'invitaci%' THEN 'en_juridica'::estado_solicitud
-                     WHEN $1::boolean = true THEN 'aprobado_financiera'::estado_solicitud
+                     WHEN $1::boolean = true THEN 'en_juridica_concepto'::estado_solicitud
                      ELSE 'rechazado_financiera'::estado_solicitud
                  END,
                  comentario_financiera = COALESCE($2, comentario_financiera),
@@ -1710,7 +1791,6 @@ app.post('/api/solicitudes/:id/aprobar-financiera', async (req, res) => {
         }
 
         const solFin = result.rows[0];
-        const derivadaJuridica = aprobar && solFin.estado === 'en_juridica';
 
         // Verificar que el usuario existe en la BD antes de registrar el log
         let usuarioIdLog = null;
@@ -1724,7 +1804,7 @@ app.post('/api/solicitudes/:id/aprobar-financiera', async (req, res) => {
                 tipo_log: 'negocio', modulo: 'solicitudes', tabla: 'solicitudes',
                 registro_id: solFin.id, accion: aprobar ? 'APROBACION' : 'RECHAZO',
                 campo: 'estado', valor_anterior: 'en_financiera', valor_nuevo: solFin.estado,
-                descripcion: `Financiera ${aprobar ? 'aprobó' : 'rechazó'} la solicitud ${solFin.codigo}${derivadaJuridica ? ' → derivada directamente a Jurídica (modalidad Invitación)' : ''}${rubro ? ' | Rubro: ' + rubro : ''}${comentario ? ' | ' + comentario : ''}`,
+                descripcion: `Financiera ${aprobar ? 'aprobó' : 'rechazó'} la solicitud ${solFin.codigo}${rubro ? ' | Rubro: ' + rubro : ''}${comentario ? ' | ' + comentario : ''}`,
                 usuario_id: usuarioIdLog, rol_usuario: 'financiera',
                 ip_address: getClientIp(req), resultado: 'exitoso'
             });
@@ -1746,8 +1826,7 @@ app.get('/api/secretaria/comite', async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT * FROM v_solicitudes_resumen
-             WHERE estado = 'aprobado_financiera'
-               AND LOWER(modalidad::text) NOT LIKE 'invitaci%'
+             WHERE estado = 'en_comite'
              ORDER BY actualizado_en DESC`
         );
         return res.json(result.rows);
@@ -1763,9 +1842,9 @@ app.get('/api/secretaria/metrics', async (_req, res) => {
     try {
         const result = await pool.query(`
             SELECT
-                COUNT(*) FILTER (WHERE estado = 'aprobado_financiera' AND resultado_comite IS NULL AND LOWER(modalidad::text) NOT LIKE 'invitaci%') AS pendientes,
-                COUNT(*) FILTER (WHERE resultado_comite = 'aprobado' AND LOWER(modalidad::text) NOT LIKE 'invitaci%') AS aprobadas,
-                COUNT(*) FILTER (WHERE resultado_comite = 'rechazado' AND LOWER(modalidad::text) NOT LIKE 'invitaci%') AS rechazadas
+                COUNT(*) FILTER (WHERE estado = 'en_comite' AND resultado_comite IS NULL) AS pendientes,
+                COUNT(*) FILTER (WHERE resultado_comite = 'aprobado') AS aprobadas,
+                COUNT(*) FILTER (WHERE resultado_comite = 'rechazado') AS rechazadas
             FROM solicitudes
         `);
         return res.json(result.rows[0]);
@@ -1949,6 +2028,10 @@ app.post('/api/solicitudes/:id/comite', async (req, res) => {
         return res.status(400).json({ error: 'resultado debe ser "aprobado", "rechazado" o "en_revision"' });
     }
 
+    if (resultado === 'en_revision' && !String(comentario || '').trim()) {
+        return res.status(400).json({ error: 'comentario es obligatorio para devolver la solicitud' });
+    }
+
     try {
         // Si queda en revisión, se devuelve al solicitante para corrección y reinicio del flujo.
         const nuevoEstado =
@@ -2071,6 +2154,198 @@ app.post('/api/solicitudes/:id/juridica', async (req, res) => {
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al registrar resultado de jurídica' });
+    }
+});
+
+// ─── RUTA: Guardar Concepto Jurídico y Garantías (Jurídica) ──
+// PUT /api/solicitudes/:id/concepto-juridico
+app.put('/api/solicitudes/:id/concepto-juridico', async (req, res) => {
+    const { id } = req.params;
+    const { concepto_juridico, garantias, tiene_riesgos_juridicos, riesgos_juridicos, usuario_email } = req.body;
+
+    try {
+        const tieneRiesgos = tiene_riesgos_juridicos === true || tiene_riesgos_juridicos === 'si';
+
+        const result = await pool.query(
+            `UPDATE solicitudes
+             SET concepto_juridico = $1,
+                 garantias = $2,
+                 tiene_riesgos_juridicos = $3,
+                 riesgos_juridicos = CASE WHEN $3 THEN $4 ELSE NULL END,
+                 actualizado_en = NOW()
+             WHERE id = $5::uuid
+             RETURNING id, codigo, concepto_juridico, garantias, tiene_riesgos_juridicos, riesgos_juridicos`,
+            [concepto_juridico || null, garantias || null, tieneRiesgos, riesgos_juridicos || null, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Solicitud no encontrada' });
+        }
+
+        const solActualizada = result.rows[0];
+        const uJur = await usuarioPorEmail(usuario_email);
+        await registrarLog({
+            tipo_log: 'negocio', modulo: 'juridica', tabla: 'solicitudes',
+            registro_id: solActualizada.id, accion: 'ACTUALIZACION',
+            campo: 'concepto_juridico', valor_anterior: null, valor_nuevo: concepto_juridico || null,
+            descripcion: `Jurídica registró el concepto jurídico y garantías de la solicitud ${solActualizada.codigo}`,
+            usuario_id: uJur?.id || null, rol_usuario: uJur?.rol || 'juridica',
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
+        return res.json(solActualizada);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al guardar el concepto jurídico: ' + (err.message || err.toString()) });
+    }
+});
+
+// ─── RUTA: Enviar Concepto Jurídico → Riesgos o Comité ──
+// POST /api/solicitudes/:id/enviar-concepto-juridico
+// Cierra la primera visita de Jurídica (solo 7.1 Concepto jurídico, 7.2 Garantías,
+// 7.3 ¿Tiene riesgos jurídicos?) y deriva a Riesgos (si aplica) o directo a Comité.
+// Invitación no pasa por Comité: si no tiene riesgos jurídicos, o una vez Riesgos
+// la resuelve, vuelve directo a Jurídica para la segunda visita.
+app.post('/api/solicitudes/:id/enviar-concepto-juridico', async (req, res) => {
+    const { id } = req.params;
+    const { usuario_email } = req.body;
+
+    try {
+        const actual = await pool.query(
+            `SELECT id, codigo, estado, concepto_juridico, garantias, tiene_riesgos_juridicos, modalidad
+             FROM solicitudes WHERE id = $1::uuid`,
+            [id]
+        );
+        if (actual.rows.length === 0) {
+            return res.status(404).json({ error: 'Solicitud no encontrada' });
+        }
+        const sol = actual.rows[0];
+        if (sol.estado !== 'en_juridica_concepto') {
+            return res.status(400).json({ error: 'La solicitud no está en la fase de concepto jurídico.' });
+        }
+        if (!String(sol.concepto_juridico || '').trim() || !String(sol.garantias || '').trim() || sol.tiene_riesgos_juridicos === null) {
+            return res.status(400).json({ error: 'Diligencie el concepto jurídico, las garantías y si tiene riesgos jurídicos antes de enviar.' });
+        }
+
+        const esInvitacion = String(sol.modalidad || '').toLowerCase().startsWith('invitaci');
+        const nuevoEstado = sol.tiene_riesgos_juridicos
+            ? 'en_riesgos'
+            : (esInvitacion ? 'en_juridica' : 'en_comite');
+
+        const result = await pool.query(
+            `UPDATE solicitudes
+             SET estado = $1::estado_solicitud,
+                 fecha_envio_juridica = NOW(),
+                 actualizado_en = NOW()
+             WHERE id = $2::uuid AND estado = 'en_juridica_concepto'
+             RETURNING id, codigo, estado`,
+            [nuevoEstado, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Solicitud no encontrada o ya fue procesada' });
+        }
+
+        const solEnviada = result.rows[0];
+        const uJur = await usuarioPorEmail(usuario_email);
+        await registrarLog({
+            tipo_log: 'negocio', modulo: 'juridica', tabla: 'solicitudes',
+            registro_id: solEnviada.id, accion: 'ACTUALIZACION',
+            campo: 'estado', valor_anterior: 'en_juridica_concepto', valor_nuevo: solEnviada.estado,
+            descripcion: `Jurídica envió el concepto jurídico de la solicitud ${solEnviada.codigo}${nuevoEstado === 'en_riesgos' ? ' → derivada a Riesgos' : nuevoEstado === 'en_comite' ? ' → derivada a Comité' : ' → retoma Jurídica'}`,
+            usuario_id: uJur?.id || null, rol_usuario: uJur?.rol || 'juridica',
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
+        return res.json(solEnviada);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al enviar el concepto jurídico' });
+    }
+});
+
+// ─── RUTAS PARA EL ROL RIESGOS ────────────────────────────────
+// GET /api/riesgos/solicitudes
+app.get('/api/riesgos/solicitudes', async (_req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT * FROM v_solicitudes_resumen
+             WHERE estado = 'en_riesgos'
+             ORDER BY actualizado_en DESC`
+        );
+        return res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener solicitudes para riesgos' });
+    }
+});
+
+// GET /api/riesgos/metrics
+app.get('/api/riesgos/metrics', async (_req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                COUNT(*) FILTER (WHERE estado = 'en_riesgos') AS pendientes,
+                COUNT(*) FILTER (WHERE resultado_riesgos = 'aprobado') AS aprobadas,
+                COUNT(*) FILTER (WHERE resultado_riesgos = 'rechazado') AS rechazadas
+            FROM solicitudes
+        `);
+        return res.json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener métricas de riesgos' });
+    }
+});
+
+// ─── RUTA: Registrar resultado de Riesgos para una solicitud ───────
+// POST /api/solicitudes/:id/riesgos
+app.post('/api/solicitudes/:id/riesgos', async (req, res) => {
+    const { id } = req.params;
+    const { resultado, comentario, usuario_email } = req.body;
+
+    if (!resultado || !['aprobado', 'rechazado'].includes(resultado)) {
+        return res.status(400).json({ error: 'resultado debe ser "aprobado" o "rechazado"' });
+    }
+
+    try {
+        const uRiesgos = await usuarioPorEmail(usuario_email);
+
+        // Invitación no pasa por Comité: al aprobar Riesgos, vuelve directo a Jurídica.
+        const result = await pool.query(
+            `UPDATE solicitudes
+             SET resultado_riesgos = $1::text,
+                 comentario_riesgos = COALESCE($2::text, comentario_riesgos),
+                 riesgos_id = COALESCE($3::uuid, riesgos_id),
+                 estado = CASE
+                     WHEN $1::text = 'rechazado' THEN 'rechazado_riesgos'::estado_solicitud
+                     WHEN LOWER(modalidad::text) LIKE 'invitaci%' THEN 'en_juridica'::estado_solicitud
+                     ELSE 'en_comite'::estado_solicitud
+                 END,
+                 fecha_respuesta_riesgos = NOW(),
+                 actualizado_en = NOW()
+             WHERE id = $4::uuid AND estado = 'en_riesgos'
+             RETURNING id, codigo, estado, resultado_riesgos`,
+            [resultado, comentario || null, uRiesgos?.id || null, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Solicitud no encontrada o ya fue procesada' });
+        }
+
+        const solRiesgos = result.rows[0];
+        await registrarLog({
+            tipo_log: 'negocio', modulo: 'solicitudes', tabla: 'solicitudes',
+            registro_id: solRiesgos.id, accion: resultado === 'aprobado' ? 'APROBACION' : 'RECHAZO',
+            campo: 'resultado_riesgos', valor_anterior: null, valor_nuevo: resultado,
+            descripcion: `Riesgos ${resultado === 'aprobado' ? 'aprobó' : 'rechazó'} la solicitud ${solRiesgos.codigo}${comentario ? ': ' + comentario : ''}`,
+            usuario_id: uRiesgos?.id || null, rol_usuario: uRiesgos?.rol || 'riesgos',
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
+        return res.json(solRiesgos);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al registrar resultado de riesgos' });
     }
 });
 
@@ -2302,8 +2577,8 @@ app.get('/api/financiera/metrics', async (req, res) => {
         const statsQuery = `
             SELECT 
                 COUNT(*) FILTER (WHERE estado = 'en_financiera') as pendientes,
-                COUNT(*) FILTER (WHERE estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'finalizado')) as aprobadas,
-                SUM(valor_en_cop) FILTER (WHERE estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'finalizado')) as valor_total,
+                COUNT(*) FILTER (WHERE estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'en_juridica_concepto', 'en_riesgos', 'en_comite', 'finalizado')) as aprobadas,
+                SUM(valor_en_cop) FILTER (WHERE estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'en_juridica_concepto', 'en_riesgos', 'en_comite', 'finalizado')) as valor_total,
                 (SELECT COUNT(*) FROM usuarios WHERE rol = 'supervisor') as solicitantes
             FROM solicitudes 
         `;
@@ -2315,7 +2590,7 @@ app.get('/api/financiera/metrics', async (req, res) => {
                 TO_CHAR(actualizado_en, 'TMMon') as name, 
                 SUM(COALESCE(presupuesto_aprobado, valor_en_cop, 0))::bigint as valor
             FROM solicitudes 
-            WHERE estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'finalizado')
+            WHERE estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'en_juridica_concepto', 'en_riesgos', 'en_comite', 'finalizado')
               AND actualizado_en >= NOW() - INTERVAL '6 months'
             GROUP BY TO_CHAR(actualizado_en, 'TMMon'), DATE_TRUNC('month', actualizado_en)
             ORDER BY DATE_TRUNC('month', actualizado_en)
@@ -2333,7 +2608,7 @@ app.get('/api/financiera/metrics', async (req, res) => {
                 END as date
             FROM solicitudes s
             JOIN usuarios u ON s.solicitante_id = u.id
-            WHERE s.estado IN ('en_financiera', 'aprobado_financiera', 'rechazado_financiera', 'aprobado_comite', 'rechazado_comite', 'en_juridica')
+            WHERE s.estado IN ('en_financiera', 'aprobado_financiera', 'rechazado_financiera', 'aprobado_comite', 'rechazado_comite', 'en_juridica', 'en_juridica_concepto', 'en_riesgos', 'rechazado_riesgos', 'en_comite')
             ORDER BY s.actualizado_en DESC
             LIMIT 5
         `;
@@ -2391,7 +2666,7 @@ app.get('/api/financiera/reporte_consumo', async (req, res) => {
             `SELECT g.nombre as gerencia, SUM(s.presupuesto_aprobado) as total
              FROM gerencias g
              LEFT JOIN solicitudes s ON g.id = s.gerencia_id
-             WHERE s.estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'finalizado')
+             WHERE s.estado IN ('aprobado_financiera', 'aprobado_comite', 'en_juridica', 'enviado_juridica', 'en_juridica_concepto', 'en_riesgos', 'en_comite', 'finalizado')
              GROUP BY g.nombre`
         );
         return res.json(result.rows);
@@ -2427,6 +2702,7 @@ app.get('/api/financiera/presupuesto-vigencia', async (req, res) => {
     const vigencia = parseInt(req.query.vigencia) || new Date().getFullYear();
     try {
         await ensurePresupuestoVigencia();
+        await ensureReconocimientosGasto();
         const result = await pool.query(
             `SELECT
                 pv.id,
@@ -2442,15 +2718,30 @@ app.get('/api/financiera/presupuesto-vigencia', async (req, res) => {
 
                 -- Certificado: CDP emitido, aún en trámite (puede liberarse si comité/jurídica rechazan)
                 COALESCE(SUM(s.presupuesto_aprobado) FILTER (
-                    WHERE s.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica')
+                    WHERE s.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica','en_juridica_concepto','en_riesgos','en_comite')
                 ), 0)::bigint AS certificado,
 
-                -- Disponible real = total − reservas vigencia anterior − comprometido firme − certificado
+                -- Reconocido: gastos menores (transporte, alimentación, etc.) ya ejecutados, fuera del flujo de solicitudes
+                (SELECT COALESCE(SUM(rg.monto), 0) FROM reconocimientos_gasto rg
+                  WHERE rg.gerencia_nombre = pv.gerencia_nombre AND rg.vigencia = pv.vigencia AND rg.estado = 'activo'
+                )::bigint AS reconocido_gasto,
+
+                -- Disponible real = total − reservas vigencia anterior − comprometido firme − certificado − reconocido
                 (pv.monto_total
                     - pv.comprometido_vigencia_anterior
                     - COALESCE(SUM(s.presupuesto_aprobado) FILTER (WHERE s.estado IN ('aprobado_juridica','finalizado','contratado','cerrado')), 0)
-                    - COALESCE(SUM(s.presupuesto_aprobado) FILTER (WHERE s.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica')), 0)
-                )::bigint AS disponible
+                    - COALESCE(SUM(s.presupuesto_aprobado) FILTER (WHERE s.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica','en_juridica_concepto','en_riesgos','en_comite')), 0)
+                    - (SELECT COALESCE(SUM(rg.monto), 0) FROM reconocimientos_gasto rg
+                        WHERE rg.gerencia_nombre = pv.gerencia_nombre AND rg.vigencia = pv.vigencia AND rg.estado = 'activo')
+                )::bigint AS disponible,
+
+                -- Disponible para trámite = asignado − comprometido firme − CDP en trámite − reconocido (no descuenta reservas)
+                (pv.monto_total
+                    - COALESCE(SUM(s.presupuesto_aprobado) FILTER (WHERE s.estado IN ('aprobado_juridica','finalizado','contratado','cerrado')), 0)
+                    - COALESCE(SUM(s.presupuesto_aprobado) FILTER (WHERE s.estado IN ('aprobado_financiera','aprobado_comite','en_juridica','enviado_juridica','en_juridica_concepto','en_riesgos','en_comite')), 0)
+                    - (SELECT COALESCE(SUM(rg.monto), 0) FROM reconocimientos_gasto rg
+                        WHERE rg.gerencia_nombre = pv.gerencia_nombre AND rg.vigencia = pv.vigencia AND rg.estado = 'activo')
+                )::bigint AS disponible_tramite
 
              FROM presupuesto_vigencia pv
              LEFT JOIN solicitudes s
@@ -2498,6 +2789,143 @@ app.post('/api/financiera/presupuesto-vigencia', async (req, res) => {
     } catch (err) {
         console.error('Error presupuesto-vigencia POST:', err);
         return res.status(500).json({ error: 'Error al guardar presupuesto de vigencia' });
+    }
+});
+
+// ─── RECONOCIMIENTO DE GASTO (gastos menores fuera del flujo de solicitudes) ──
+async function ensureReconocimientosGasto() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS reconocimientos_gasto (
+            id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+            gerencia_nombre VARCHAR(255) NOT NULL,
+            vigencia INTEGER NOT NULL,
+            concepto VARCHAR(50) NOT NULL,
+            descripcion TEXT,
+            monto NUMERIC(18,2) NOT NULL,
+            fecha_gasto DATE NOT NULL,
+            soporte_url TEXT,
+            soporte_nombre TEXT,
+            registrado_por_email VARCHAR(255),
+            registrado_por_nombre VARCHAR(255),
+            estado VARCHAR(20) NOT NULL DEFAULT 'activo',
+            motivo_anulacion TEXT,
+            anulado_por_email VARCHAR(255),
+            anulado_en TIMESTAMPTZ,
+            creado_en TIMESTAMPTZ DEFAULT NOW()
+        )
+    `);
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_reconocimientos_gasto_gerencia_vigencia
+        ON reconocimientos_gasto (gerencia_nombre, vigencia, estado)
+    `);
+}
+
+const uploadReconocimientos = multer({
+    storage: multer.diskStorage({
+        destination: (_req, _file, cb) => cb(null, RECONOCIMIENTOS_UPLOADS_DIR),
+        filename: (_req, file, cb) => {
+            const unique = Date.now() + '-' + Math.round(Math.random() * 1e6);
+            const ext = path.extname(file.originalname);
+            cb(null, `${unique}${ext}`);
+        }
+    }),
+    limits: { fileSize: 30 * 1024 * 1024 },
+});
+
+// POST /api/financiera/reconocimientos-gasto/upload — sube el soporte (imagen/PDF)
+app.post('/api/financiera/reconocimientos-gasto/upload', (req, res) => {
+    uploadReconocimientos.single('file')(req, res, (err) => {
+        if (err) {
+            console.error('Upload error:', err.message);
+            return res.status(400).json({ error: err.message || 'Error al procesar el archivo' });
+        }
+        if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo' });
+        const url = `/api/uploads/reconocimientos/${req.file.filename}`;
+        return res.json({ url, nombre: req.file.originalname });
+    });
+});
+
+// GET /api/financiera/reconocimientos-gasto?vigencia=2026&gerencia_nombre=...
+app.get('/api/financiera/reconocimientos-gasto', async (req, res) => {
+    const vigencia = parseInt(req.query.vigencia) || new Date().getFullYear();
+    const gerencia_nombre = req.query.gerencia_nombre;
+    if (!gerencia_nombre) return res.status(400).json({ error: 'Se requiere gerencia_nombre' });
+    try {
+        await ensureReconocimientosGasto();
+        const result = await pool.query(
+            `SELECT id, gerencia_nombre, vigencia, concepto, descripcion, monto::bigint AS monto,
+                    fecha_gasto, soporte_url, soporte_nombre, registrado_por_email, registrado_por_nombre,
+                    estado, motivo_anulacion, anulado_por_email, anulado_en, creado_en
+             FROM reconocimientos_gasto
+             WHERE vigencia = $1 AND gerencia_nombre = $2
+             ORDER BY fecha_gasto DESC, creado_en DESC`,
+            [vigencia, gerencia_nombre]
+        );
+        return res.json(result.rows);
+    } catch (err) {
+        console.error('Error reconocimientos-gasto GET:', err);
+        return res.status(500).json({ error: 'Error al obtener reconocimientos de gasto' });
+    }
+});
+
+// POST /api/financiera/reconocimientos-gasto — registra un gasto menor reconocido
+app.post('/api/financiera/reconocimientos-gasto', async (req, res) => {
+    const {
+        gerencia_nombre, vigencia, concepto, descripcion, monto, fecha_gasto,
+        soporte_url, soporte_nombre, registrado_por_email, registrado_por_nombre,
+    } = req.body;
+    if (!gerencia_nombre || !vigencia || !concepto || !fecha_gasto) {
+        return res.status(400).json({ error: 'Se requieren gerencia_nombre, vigencia, concepto y fecha_gasto' });
+    }
+    const montoNum = Number(monto);
+    if (!montoNum || montoNum <= 0) {
+        return res.status(400).json({ error: 'Ingrese un monto válido mayor a cero.' });
+    }
+    try {
+        await ensureReconocimientosGasto();
+        const result = await pool.query(
+            `INSERT INTO reconocimientos_gasto
+               (gerencia_nombre, vigencia, concepto, descripcion, monto, fecha_gasto,
+                soporte_url, soporte_nombre, registrado_por_email, registrado_por_nombre)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+             RETURNING id, gerencia_nombre, vigencia, concepto, descripcion, monto::bigint AS monto,
+                       fecha_gasto, soporte_url, soporte_nombre, registrado_por_email, registrado_por_nombre,
+                       estado, creado_en`,
+            [gerencia_nombre, vigencia, concepto, descripcion || null, montoNum, fecha_gasto,
+                soporte_url || null, soporte_nombre || null, registrado_por_email || null, registrado_por_nombre || null]
+        );
+        return res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error reconocimientos-gasto POST:', err);
+        return res.status(500).json({ error: 'Error al registrar el reconocimiento de gasto' });
+    }
+});
+
+// PATCH /api/financiera/reconocimientos-gasto/:id/anular — anula (soft-delete) un reconocimiento
+app.patch('/api/financiera/reconocimientos-gasto/:id/anular', async (req, res) => {
+    const { id } = req.params;
+    const { motivo, anulado_por_email } = req.body;
+    if (!motivo || !String(motivo).trim()) {
+        return res.status(400).json({ error: 'Se requiere el motivo de anulación.' });
+    }
+    try {
+        await ensureReconocimientosGasto();
+        const actual = await pool.query('SELECT estado FROM reconocimientos_gasto WHERE id = $1', [id]);
+        if (actual.rows.length === 0) return res.status(404).json({ error: 'Reconocimiento no encontrado' });
+        if (actual.rows[0].estado === 'anulado') {
+            return res.status(409).json({ error: 'Este reconocimiento ya fue anulado.' });
+        }
+        const result = await pool.query(
+            `UPDATE reconocimientos_gasto
+             SET estado = 'anulado', motivo_anulacion = $2, anulado_por_email = $3, anulado_en = NOW()
+             WHERE id = $1
+             RETURNING id, estado, motivo_anulacion, anulado_por_email, anulado_en`,
+            [id, motivo.trim(), anulado_por_email || null]
+        );
+        return res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error reconocimientos-gasto anular:', err);
+        return res.status(500).json({ error: 'Error al anular el reconocimiento de gasto' });
     }
 });
 
@@ -2621,7 +3049,7 @@ app.get('/api/juridica/solicitudes', async (_req, res) => {
         const result = await pool.query(
             `SELECT id, codigo, objeto, modalidad, solicitante_nombre, gerencia_nombre, estado, actualizado_en
              FROM v_solicitudes_resumen
-             WHERE estado = 'en_juridica'
+             WHERE estado IN ('en_juridica', 'en_juridica_concepto')
              ORDER BY actualizado_en DESC`
         );
         return res.json(result.rows);
@@ -3354,8 +3782,8 @@ app.patch('/api/juridica/solicitudes/:id/supervisor', async (req, res) => {
 app.get('/api/juridica/bandeja', async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT * FROM v_solicitudes_resumen 
-             WHERE estado = 'en_juridica'
+            `SELECT * FROM v_solicitudes_resumen
+             WHERE estado IN ('en_juridica', 'en_juridica_concepto')
              ORDER BY actualizado_en DESC`
         );
         return res.json(result.rows);
@@ -3478,7 +3906,7 @@ app.get('/api/juridica/metrics', async (req, res) => {
     try {
         const statsQuery = `
             SELECT 
-                COUNT(*) FILTER (WHERE s.estado = 'en_juridica') as pendientes,
+                COUNT(*) FILTER (WHERE s.estado IN ('en_juridica', 'en_juridica_concepto')) as pendientes,
                 COUNT(*) FILTER (
                     WHERE s.estado = 'en_juridica'
                       AND d.evaluacion_json IS NOT NULL
@@ -3500,7 +3928,8 @@ app.get('/api/juridica/metrics', async (req, res) => {
                    s.valor_moneda_cop_texto, s.valor_moneda_usd_texto
             FROM solicitudes s
             LEFT JOIN usuarios u ON s.solicitante_id = u.id
-            WHERE s.estado IN ('en_juridica', 'aprobado_juridica', 'rechazado_juridica',
+            WHERE s.estado IN ('en_juridica', 'en_juridica_concepto', 'en_riesgos', 'en_comite', 'rechazado_riesgos',
+                               'aprobado_juridica', 'rechazado_juridica',
                                'rechazado_comite', 'enviado_juridica', 'finalizado', 'contratado')
             ORDER BY s.actualizado_en DESC
             LIMIT 12
@@ -3518,8 +3947,17 @@ app.get('/api/juridica/metrics', async (req, res) => {
 });
 
 // Contratos aprobados por jurídica (todos los que pasaron por el proceso)
-app.get('/api/juridica/contratos', async (_req, res) => {
+// ?proveedor=<nombre> — opcional, filtra solo los contratos de ese proveedor
+// (se usa desde el directorio de Proveedores para mostrar sus contratos).
+app.get('/api/juridica/contratos', async (req, res) => {
+    const { proveedor } = req.query;
     try {
+        const params = [];
+        let filtroProveedor = '';
+        if (proveedor) {
+            params.push(String(proveedor).trim());
+            filtroProveedor = `AND UPPER(TRIM(p.nombre_proveedor)) = UPPER(TRIM($${params.length}))`;
+        }
         const result = await pool.query(`
             SELECT
                 s.id, s.codigo, s.objeto, s.estado, s.moneda,
@@ -3538,15 +3976,143 @@ app.get('/api/juridica/contratos', async (_req, res) => {
             LEFT JOIN solicitudes_detalle_juridico sdj ON sdj.solicitud_id = s.id
             WHERE s.estado NOT IN (
                 'borrador', 'enviado_gerente', 'en_financiera',
-                'en_juridica', 'rechazado_juridica', 'rechazado_gerente',
-                'rechazado_financiera', 'rechazado_comite', 'cancelado'
+                'en_juridica', 'en_juridica_concepto', 'en_riesgos', 'en_comite',
+                'rechazado_juridica', 'rechazado_gerente',
+                'rechazado_financiera', 'rechazado_comite', 'rechazado_riesgos', 'cancelado'
             )
+            ${filtroProveedor}
             ORDER BY s.actualizado_en DESC
-        `);
+        `, params);
         return res.json(result.rows);
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al obtener contratos' });
+    }
+});
+
+// Directorio de proveedores: agrega participaciones (proponentes), evaluaciones
+// de desempeño y bloqueos, agrupando por nombre normalizado (no existe tabla
+// maestra de proveedores — se deriva de las tablas donde el nombre ya se registra).
+app.get('/api/juridica/proveedores', async (_req, res) => {
+    try {
+        const result = await pool.query(`
+            WITH base AS (
+                SELECT
+                    UPPER(TRIM(p.nombre_proveedor)) AS identificador,
+                    (ARRAY_AGG(p.nombre_proveedor ORDER BY p.creado_en DESC))[1] AS nombre,
+                    (ARRAY_AGG(COALESCE(NULLIF(p.correo, ''), NULLIF(p.datos_contacto, ''))
+                        ORDER BY p.creado_en DESC)
+                        FILTER (WHERE COALESCE(NULLIF(p.correo, ''), NULLIF(p.datos_contacto, '')) IS NOT NULL))[1] AS contacto,
+                    (ARRAY_AGG(NULLIF(p.correo, '') ORDER BY p.creado_en DESC)
+                        FILTER (WHERE NULLIF(p.correo, '') IS NOT NULL))[1] AS correo,
+                    COUNT(DISTINCT p.solicitud_id) AS num_procesos,
+                    COUNT(*) FILTER (WHERE p.seleccionado) AS num_seleccionado,
+                    MAX(p.creado_en) AS ultima_participacion
+                FROM proponentes p
+                WHERE p.nombre_proveedor IS NOT NULL AND TRIM(p.nombre_proveedor) != ''
+                GROUP BY UPPER(TRIM(p.nombre_proveedor))
+            ),
+            evals AS (
+                SELECT DISTINCT ON (UPPER(TRIM(nombre_proveedor)))
+                    UPPER(TRIM(nombre_proveedor)) AS identificador,
+                    total, fecha_evaluacion, observaciones, correo_proveedor
+                FROM evaluaciones_proveedor
+                WHERE nombre_proveedor IS NOT NULL AND TRIM(nombre_proveedor) != ''
+                ORDER BY UPPER(TRIM(nombre_proveedor)), fecha_evaluacion DESC
+            ),
+            -- Contratos por proveedor: mismo universo de "contrato" que usa /api/juridica/contratos
+            -- (solicitudes que ya salieron del proceso previo a jurídica/comité), y mismo criterio
+            -- de vigencia que calcularEstadoContrato() en ContratosJuridica.tsx.
+            contratos AS (
+                SELECT
+                    UPPER(TRIM(p.nombre_proveedor)) AS identificador,
+                    COUNT(*)::int AS contratos_totales,
+                    COUNT(*) FILTER (
+                        WHERE s.estado != 'finalizado'
+                          AND (
+                            s.fecha_respuesta_juridica IS NULL
+                            OR (COALESCE(s.plazo_ejecucion_meses, 0) = 0 AND COALESCE(s.plazo_ejecucion_dias, 0) = 0)
+                            OR (s.fecha_respuesta_juridica
+                                + (COALESCE(s.plazo_ejecucion_meses, 0) || ' months')::interval
+                                + (COALESCE(s.plazo_ejecucion_dias, 0) || ' days')::interval) >= NOW()
+                          )
+                    )::int AS contratos_activos
+                FROM proponentes p
+                JOIN solicitudes s ON s.id = p.solicitud_id
+                WHERE p.seleccionado = true
+                  AND p.nombre_proveedor IS NOT NULL AND TRIM(p.nombre_proveedor) != ''
+                  AND s.estado NOT IN (
+                    'borrador', 'enviado_gerente', 'en_financiera',
+                    'en_juridica', 'en_juridica_concepto', 'en_riesgos', 'en_comite',
+                    'rechazado_juridica', 'rechazado_gerente',
+                    'rechazado_financiera', 'rechazado_comite', 'rechazado_riesgos', 'cancelado'
+                  )
+                GROUP BY UPPER(TRIM(p.nombre_proveedor))
+            )
+            SELECT
+                b.identificador,
+                b.nombre,
+                COALESCE(NULLIF(e.correo_proveedor, ''), b.contacto) AS contacto,
+                COALESCE(NULLIF(e.correo_proveedor, ''), b.correo) AS correo,
+                b.num_procesos,
+                b.num_seleccionado,
+                b.ultima_participacion,
+                e.total AS ultima_calificacion,
+                e.fecha_evaluacion AS fecha_ultima_evaluacion,
+                e.observaciones AS observaciones_evaluacion,
+                (bl.id IS NOT NULL) AS bloqueado,
+                bl.motivo AS motivo_bloqueo,
+                COALESCE(c.contratos_activos, 0) AS contratos_activos,
+                COALESCE(c.contratos_totales, 0) AS contratos_totales
+            FROM base b
+            LEFT JOIN evals e ON e.identificador = b.identificador
+            LEFT JOIN proveedores_bloqueados bl ON bl.identificador = b.identificador
+            LEFT JOIN contratos c ON c.identificador = b.identificador
+            ORDER BY b.nombre
+        `);
+        return res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener el directorio de proveedores' });
+    }
+});
+
+// GET /api/proveedores/formulario-ra14?email=...&nombre=...
+// Busca el formulario RA1-4 (Creación o actualización de proveedores) más reciente
+// que coincide con este proveedor, para mostrarlo completo en el directorio de Jurídica.
+app.get('/api/proveedores/formulario-ra14', async (req, res) => {
+    const { email, nombre } = req.query;
+    if (!email && !nombre) return res.status(400).json({ error: 'email o nombre requerido' });
+
+    try {
+        await ensureConvocatoriasStorage();
+        const condiciones = [];
+        const params = [];
+        if (email) {
+            params.push(String(email).trim().toLowerCase());
+            condiciones.push(`LOWER(proponente_email) = $${params.length}`);
+        }
+        if (nombre) {
+            params.push(String(nombre).trim());
+            condiciones.push(`UPPER(TRIM(proponente_nombre)) = UPPER(TRIM($${params.length}))`);
+        }
+
+        const result = await pool.query(
+            `SELECT *
+             FROM convocatoria_invitaciones
+             WHERE (${condiciones.join(' OR ')}) AND tipo_documento IS NOT NULL
+             ORDER BY creado_en DESC
+             LIMIT 1`,
+            params
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Este proveedor no tiene un formulario RA1-4 registrado.' });
+        }
+        return res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error obteniendo formulario RA1-4 del proveedor:', err);
+        return res.status(500).json({ error: 'Error al obtener el formulario del proveedor' });
     }
 });
 
@@ -3579,6 +4145,8 @@ app.post('/api/facturas/upload', (req, res) => {
 
 // GET /api/financiera/contratos — lista de contratos activos para el selector del formulario
 // Sólo contratos con jurídica aprobada (contrato firmado) pueden facturar.
+// Un contrato 'finalizado' o 'cerrado' ya no admite nuevas facturas, así que
+// no se ofrece en el selector (ver también el guard en POST /facturas).
 app.get('/api/financiera/contratos', async (_req, res) => {
     try {
         const result = await pool.query(
@@ -3586,10 +4154,14 @@ app.get('/api/financiera/contratos', async (_req, res) => {
                     u.nombre AS supervisor_nombre, u.email AS supervisor_email
              FROM solicitudes s
              LEFT JOIN usuarios u ON u.id = s.supervision_id
-             WHERE s.estado IN ('aprobado_juridica','contratado','finalizado','cerrado')
+             WHERE s.estado IN ('aprobado_juridica','contratado')
              ORDER BY s.codigo DESC`
         );
-        return res.json(result.rows);
+        const contratos = await Promise.all(result.rows.map(async (c) => {
+            const proveedor = await obtenerProveedorContrato(c.id);
+            return { ...c, nombre_proveedor: proveedor?.nombre_proveedor || null };
+        }));
+        return res.json(contratos);
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al obtener contratos' });
@@ -3600,31 +4172,46 @@ app.get('/api/financiera/contratos', async (_req, res) => {
 app.post('/api/financiera/facturas', async (req, res) => {
     const {
         solicitud_id, nombre_solicitud, aprobador_1, aprobador_2,
-        fecha_factura, no_contrato_oc, no_factura_cxc,
-        concepto, valor, certificacion_supervisor, adjunto_url, adjunto_nombre, creado_por_email
+        fecha_factura, no_contrato_oc, no_factura_cxc, numero_ap,
+        concepto, valor, certificacion_supervisor, adjunto_url, adjunto_nombre, creado_por_email,
+        nombre_proveedor
     } = req.body;
 
-    if (!solicitud_id || !fecha_factura || !no_contrato_oc || !no_factura_cxc || !concepto) {
-        return res.status(400).json({ error: 'solicitud_id, fecha_factura, no_contrato_oc, no_factura_cxc y concepto son requeridos' });
+    if (!solicitud_id || !fecha_factura || !no_contrato_oc || !no_factura_cxc || !concepto || !String(numero_ap || '').trim()) {
+        return res.status(400).json({ error: 'solicitud_id, fecha_factura, no_contrato_oc, no_factura_cxc, numero_ap y concepto son requeridos' });
     }
     try {
         const solRes = await pool.query('SELECT estado FROM solicitudes WHERE id = $1', [solicitud_id]);
         if (solRes.rows.length === 0) return res.status(404).json({ error: 'Solicitud no encontrada' });
-        const ESTADOS_CONTRATO_FIRMADO = ['aprobado_juridica', 'contratado', 'finalizado', 'cerrado'];
-        if (!ESTADOS_CONTRATO_FIRMADO.includes(solRes.rows[0].estado)) {
+        const estadoActual = solRes.rows[0].estado;
+
+        // Un contrato finalizado (evaluación de proveedor firmada) o cerrado
+        // ya no admite nuevas facturas.
+        if (estadoActual === 'finalizado' || estadoActual === 'cerrado') {
+            return res.status(409).json({ error: 'El contrato ya fue finalizado y no admite el registro de nuevas facturas.' });
+        }
+
+        const ESTADOS_CONTRATO_FIRMADO = ['aprobado_juridica', 'contratado'];
+        if (!ESTADOS_CONTRATO_FIRMADO.includes(estadoActual)) {
             return res.status(409).json({ error: 'No se puede registrar la factura: el contrato aún no ha sido aprobado por jurídica' });
+        }
+
+        let proveedorFinal = nombre_proveedor || null;
+        if (!proveedorFinal) {
+            const proveedor = await obtenerProveedorContrato(solicitud_id);
+            proveedorFinal = proveedor?.nombre_proveedor || null;
         }
 
         const result = await pool.query(
             `INSERT INTO facturas_contrato
                (solicitud_id, nombre_solicitud, aprobador_1, aprobador_2,
-                fecha_factura, no_contrato_oc, no_factura_cxc, concepto,
-                valor, certificacion_supervisor, adjunto_url, adjunto_nombre, creado_por_email, estado)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pendiente')
+                fecha_factura, no_contrato_oc, no_factura_cxc, numero_ap, concepto,
+                valor, certificacion_supervisor, adjunto_url, adjunto_nombre, creado_por_email, nombre_proveedor, estado)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pendiente')
              RETURNING *`,
             [solicitud_id, nombre_solicitud || null, aprobador_1 || null, aprobador_2 || null,
-                fecha_factura, no_contrato_oc, no_factura_cxc, concepto,
-                parseFloat(valor) || 0, certificacion_supervisor ?? null, adjunto_url || null, adjunto_nombre || null, creado_por_email || null]
+                fecha_factura, no_contrato_oc, no_factura_cxc, numero_ap.trim(), concepto,
+                parseFloat(valor) || 0, certificacion_supervisor ?? null, adjunto_url || null, adjunto_nombre || null, creado_por_email || null, proveedorFinal]
         );
         return res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -3639,6 +4226,9 @@ app.patch('/api/supervisor/facturas/:id/certificar', async (req, res) => {
     const { aprobado, comentario } = req.body; // aprobado: true | false
     if (typeof aprobado !== 'boolean') {
         return res.status(400).json({ error: '"aprobado" debe ser true o false' });
+    }
+    if (aprobado === false && !String(comentario || '').trim()) {
+        return res.status(400).json({ error: 'comentario es obligatorio al rechazar la factura' });
     }
     try {
         // Recalcular estado global
@@ -3689,7 +4279,7 @@ app.get('/api/gerente/historial-facturas', async (req, res) => {
         const gerenciaId = userRes.rows[0].gerencia_id;
         const result = await pool.query(`
             SELECT
-                fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.concepto, fc.valor,
+                fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.numero_ap, fc.concepto, fc.valor,
                 fc.fecha_factura, fc.estado, fc.aprobado_gerente, fc.comentario_gerente,
                 fc.actualizado_en, fc.creado_en,
                 s.codigo AS contrato_codigo, s.objeto AS contrato_objeto
@@ -3712,6 +4302,9 @@ app.patch('/api/gerente/facturas/:id/aprobar', async (req, res) => {
     const { aprobado, comentario } = req.body;
     if (typeof aprobado !== 'boolean') {
         return res.status(400).json({ error: '"aprobado" debe ser true o false' });
+    }
+    if (aprobado === false && !String(comentario || '').trim()) {
+        return res.status(400).json({ error: 'comentario es obligatorio al rechazar la factura' });
     }
     try {
         const current = await pool.query('SELECT aprobado_supervisor FROM facturas_contrato WHERE id=$1', [id]);
@@ -3745,7 +4338,7 @@ app.get('/api/supervisor/facturas-pendientes', async (req, res) => {
         if (userRes.rows.length === 0) return res.json([]);
         const userId = userRes.rows[0].id;
         const result = await pool.query(
-            `SELECT fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.concepto, fc.valor,
+            `SELECT fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.numero_ap, fc.concepto, fc.valor,
                     fc.fecha_factura, fc.estado, fc.aprobado_supervisor,
                     s.id AS solicitud_id, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto
              FROM facturas_contrato fc
@@ -3773,7 +4366,7 @@ app.get('/api/supervisor/historial-facturas', async (req, res) => {
         if (userRes.rows.length === 0) return res.json([]);
         const userId = userRes.rows[0].id;
         const result = await pool.query(
-            `SELECT fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.concepto, fc.valor,
+            `SELECT fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.numero_ap, fc.concepto, fc.valor,
                     fc.fecha_factura, fc.estado, fc.aprobado_supervisor, fc.comentario_supervisor,
                     fc.actualizado_en, fc.creado_en,
                     s.id AS solicitud_id, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto
@@ -3816,7 +4409,7 @@ app.post('/api/supervisor/contratos/:id/facturas', async (req, res) => {
         nombre_solicitud, aprobador_1, aprobador_2,
         fecha_factura, no_contrato_oc, no_factura_cxc,
         concepto, certificacion_supervisor, adjunto_url,
-        creado_por_email
+        creado_por_email, nombre_proveedor
     } = req.body;
 
     if (!fecha_factura || !no_contrato_oc || !no_factura_cxc || !concepto) {
@@ -3824,8 +4417,20 @@ app.post('/api/supervisor/contratos/:id/facturas', async (req, res) => {
     }
 
     try {
+        const solRes = await pool.query('SELECT estado FROM solicitudes WHERE id = $1', [id]);
+        if (solRes.rows.length === 0) return res.status(404).json({ error: 'Contrato no encontrado' });
+        if (['finalizado', 'cerrado'].includes(solRes.rows[0].estado)) {
+            return res.status(409).json({ error: 'El contrato ya fue finalizado y no admite el registro de nuevas facturas.' });
+        }
+
+        let proveedorFinal = nombre_proveedor || null;
+        if (!proveedorFinal) {
+            const proveedor = await obtenerProveedorContrato(id);
+            proveedorFinal = proveedor?.nombre_proveedor || null;
+        }
+
         const result = await pool.query(
-            'INSERT INTO facturas_contrato (solicitud_id, nombre_solicitud, aprobador_1, aprobador_2, fecha_factura, no_contrato_oc, no_factura_cxc, concepto, certificacion_supervisor, adjunto_url, creado_por_email) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
+            'INSERT INTO facturas_contrato (solicitud_id, nombre_solicitud, aprobador_1, aprobador_2, fecha_factura, no_contrato_oc, no_factura_cxc, concepto, certificacion_supervisor, adjunto_url, creado_por_email, nombre_proveedor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *',
             [
                 id,
                 nombre_solicitud || null,
@@ -3838,6 +4443,7 @@ app.post('/api/supervisor/contratos/:id/facturas', async (req, res) => {
                 certificacion_supervisor === true || certificacion_supervisor === 'true',
                 adjunto_url || null,
                 creado_por_email || null,
+                proveedorFinal,
             ]
         );
         return res.status(201).json(result.rows[0]);
@@ -3985,7 +4591,8 @@ const ALLOWED_SCREEN_KEYS = new Set([
     'Juridica',
     'Financiera',
     'Administrador',
-    'SecretariaComite'
+    'SecretariaComite',
+    'Riesgos'
 ]);
 
 async function getUserScreenPermissionsMap() {
@@ -4361,6 +4968,40 @@ async function ensureConvocatoriasStorage() {
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS acepta_tratamiento_datos_en TIMESTAMPTZ`);
     // Tipo de proponente registrado ('persona' | 'empresa') — solo aplica a registros vía link público
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS tipo_persona TEXT`);
+
+    // ── Campos del formulario RA1-4 (Creación o actualización de proveedores) ──
+    // Identificación
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS tipo_documento TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS domicilio TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS pagina_web TEXT`);
+    // Representación legal (empresas)
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS representante_legal_nombre TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS representante_legal_tipo_id TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS representante_legal_identificacion TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS representante_legal_direccion TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS representante_legal_autorizado TEXT`);
+    // Datos tributarios
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS ciiu TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS tarifa TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS regimen TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS actividad_economica TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS municipio_inscripcion TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS es_gran_contribuyente BOOLEAN`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS gran_contribuyente_resolucion TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS gran_contribuyente_fecha DATE`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS es_auto_retenedor BOOLEAN`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS auto_retenedor_resolucion TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS auto_retenedor_fecha DATE`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS es_entidad_estado BOOLEAN`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS exento_impuesto_renta BOOLEAN`);
+    // Tesorería
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS banco TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS banco_sucursal TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS banco_email_contacto TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS tipo_cuenta TEXT`);
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS numero_cuenta TEXT`);
+    // Documentos adjuntos (RUT, Cámara de Comercio, Cédula RL, SARLAFT, Certificación bancaria)
+    await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS documentos_proveedor JSONB NOT NULL DEFAULT '[]'::jsonb`);
 }
 
 // POST /api/convocatorias/upload-documento
@@ -4611,6 +5252,7 @@ app.get('/api/proponente/convocatoria', proponenteRateLimit, async (req, res) =>
             ya_respondida: inv.respondida,
             respuesta_texto: inv.respuesta_texto || null,
             respuesta_archivos: inv.respuesta_archivos || [],
+            documentos_proveedor: inv.documentos_proveedor || [],
             respondida_en: inv.respondida_en || null,
             primer_acceso_en: inv.primer_acceso_en || null,
             vencida,
@@ -4625,8 +5267,20 @@ app.get('/api/proponente/convocatoria', proponenteRateLimit, async (req, res) =>
 // POST /api/proponente/responder
 // El proponente envía su respuesta (solo si no ha pasado la fecha límite)
 app.post('/api/proponente/responder', proponenteRateLimit, async (req, res) => {
-    const { token, respuesta_texto, archivos } = req.body;
+    const {
+        token, respuesta_texto, archivos,
+        banco, banco_sucursal, banco_email_contacto, tipo_cuenta, numero_cuenta,
+    } = req.body;
     if (!token) return res.status(400).json({ error: 'Token requerido' });
+
+    // ── Datos de tesorería del formulario RA1-4 (obligatorios en Fase 2) ──
+    const camposTesoreria = {
+        'Banco': banco, 'Sucursal': banco_sucursal, 'Dirección correo persona contacto': banco_email_contacto,
+        'Tipo de cuenta': tipo_cuenta, 'Número de cuenta': numero_cuenta,
+    };
+    for (const [label, valor] of Object.entries(camposTesoreria)) {
+        if (!valor || !String(valor).trim()) return res.status(400).json({ error: `El campo "${label}" es obligatorio.` });
+    }
 
     try {
         await ensureConvocatoriasStorage();
@@ -4661,6 +5315,14 @@ app.post('/api/proponente/responder', proponenteRateLimit, async (req, res) => {
             });
         }
 
+        // Verificar que los 5 documentos del formulario RA1-4 ya fueron subidos
+        const documentosProveedor = Array.isArray(inv.documentos_proveedor) ? inv.documentos_proveedor : [];
+        for (const campo of DOCUMENTOS_PROVEEDOR_CAMPOS) {
+            if (!documentosProveedor.some(d => d.tipo === campo)) {
+                return res.status(400).json({ error: `Debes adjuntar el documento: ${DOCUMENTOS_PROVEEDOR_LABELS[campo]}.` });
+            }
+        }
+
         // Combinar archivos subidos previamente con los del body
         const archivosExistentes = Array.isArray(inv.respuesta_archivos) ? inv.respuesta_archivos : [];
         const archivosNuevos = Array.isArray(archivos) ? archivos : [];
@@ -4672,12 +5334,15 @@ app.post('/api/proponente/responder', proponenteRateLimit, async (req, res) => {
              SET respondida = TRUE,
                  respuesta_texto = $2,
                  respuesta_archivos = $3::jsonb,
-                 respondida_en = NOW()
+                 respondida_en = NOW(),
+                 banco = $4, banco_sucursal = $5, banco_email_contacto = $6,
+                 tipo_cuenta = $7, numero_cuenta = $8
              WHERE id = $1::uuid`,
             [
                 inv.id,
                 respuesta_texto || '',
-                JSON.stringify(todosArchivos)
+                JSON.stringify(todosArchivos),
+                banco.trim(), banco_sucursal.trim(), banco_email_contacto.trim(), tipo_cuenta.trim(), numero_cuenta.trim(),
             ]
         );
 
@@ -4810,6 +5475,125 @@ app.delete('/api/proponente/eliminar-archivo', proponenteRateLimit, async (req, 
     }
 });
 
+// POST /api/proponente/subir-documento-ra14
+// Sube (o reemplaza) uno de los 5 documentos del formulario RA1-4 en la Fase 2.
+app.post('/api/proponente/subir-documento-ra14', proponenteRateLimit, (req, res, next) => {
+    uploadProveedores.single('archivo')(req, res, function (err) {
+        if (err instanceof multer.MulterError) {
+            return res.status(400).json({ error: 'Error al subir archivo: ' + err.message });
+        } else if (err) {
+            return res.status(400).json({ error: err.message });
+        }
+        next();
+    });
+}, async (req, res) => {
+    const { token, tipo } = req.body;
+    if (!token) { if (req.file) fs.unlinkSync(req.file.path); return res.status(400).json({ error: 'Token requerido' }); }
+    if (!DOCUMENTOS_PROVEEDOR_CAMPOS.includes(tipo)) { if (req.file) fs.unlinkSync(req.file.path); return res.status(400).json({ error: 'Tipo de documento no válido' }); }
+    if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo' });
+
+    try {
+        await ensureConvocatoriasStorage();
+
+        const invRes = await pool.query(
+            `SELECT ci.*, c.fecha_limite
+             FROM convocatoria_invitaciones ci
+             JOIN convocatorias c ON ci.convocatoria_id = c.id
+             WHERE ci.token = $1`,
+            [token]
+        );
+
+        if (invRes.rows.length === 0) {
+            fs.unlinkSync(req.file.path);
+            return res.status(404).json({ error: 'Enlace inválido' });
+        }
+
+        const inv = invRes.rows[0];
+
+        if (new Date() > new Date(inv.fecha_limite)) {
+            fs.unlinkSync(req.file.path);
+            return res.status(403).json({ error: 'El plazo ha vencido. No se aceptan archivos.' });
+        }
+        if (inv.respondida) {
+            fs.unlinkSync(req.file.path);
+            return res.status(409).json({ error: 'Ya enviaste tu respuesta. No se pueden agregar más archivos.' });
+        }
+
+        const documentos = Array.isArray(inv.documentos_proveedor) ? inv.documentos_proveedor : [];
+        const anterior = documentos.find(d => d.tipo === tipo);
+        if (anterior?.nombre_almacenado) {
+            const rutaAnterior = path.join(PROVEEDORES_UPLOADS_DIR, anterior.nombre_almacenado);
+            if (fs.existsSync(rutaAnterior)) fs.unlinkSync(rutaAnterior);
+        }
+
+        const nuevoDocumento = {
+            tipo,
+            nombre: req.file.originalname,
+            nombre_almacenado: req.file.filename,
+            tamano: req.file.size,
+            mimetype: req.file.mimetype,
+            url: `/api/uploads/proveedores/${req.file.filename}`,
+            subido_en: new Date().toISOString(),
+        };
+        const documentosActualizados = [...documentos.filter(d => d.tipo !== tipo), nuevoDocumento];
+
+        await pool.query(
+            `UPDATE convocatoria_invitaciones SET documentos_proveedor = $2::jsonb WHERE id = $1::uuid`,
+            [inv.id, JSON.stringify(documentosActualizados)]
+        );
+
+        return res.status(201).json(nuevoDocumento);
+    } catch (err) {
+        console.error(err);
+        if (req.file) fs.unlinkSync(req.file.path);
+        return res.status(500).json({ error: 'Error al subir el documento' });
+    }
+});
+
+// DELETE /api/proponente/eliminar-documento-ra14
+// Quita uno de los documentos del formulario RA1-4 (solo si no ha respondido y no ha vencido el plazo)
+app.delete('/api/proponente/eliminar-documento-ra14', proponenteRateLimit, async (req, res) => {
+    const { token, tipo } = req.body;
+    if (!token || !tipo) return res.status(400).json({ error: 'Token y tipo requeridos' });
+
+    try {
+        await ensureConvocatoriasStorage();
+
+        const invRes = await pool.query(
+            `SELECT ci.*, c.fecha_limite
+             FROM convocatoria_invitaciones ci
+             JOIN convocatorias c ON ci.convocatoria_id = c.id
+             WHERE ci.token = $1`,
+            [token]
+        );
+
+        if (invRes.rows.length === 0) return res.status(404).json({ error: 'Enlace inválido' });
+
+        const inv = invRes.rows[0];
+        if (inv.respondida) return res.status(409).json({ error: 'No se pueden eliminar documentos después de responder.' });
+        if (new Date() > new Date(inv.fecha_limite)) return res.status(403).json({ error: 'Plazo vencido.' });
+
+        const documentos = Array.isArray(inv.documentos_proveedor) ? inv.documentos_proveedor : [];
+        const documentoEliminar = documentos.find(d => d.tipo === tipo);
+
+        if (documentoEliminar?.nombre_almacenado) {
+            const filePath = path.join(PROVEEDORES_UPLOADS_DIR, documentoEliminar.nombre_almacenado);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+
+        const actualizados = documentos.filter(d => d.tipo !== tipo);
+        await pool.query(
+            `UPDATE convocatoria_invitaciones SET documentos_proveedor = $2::jsonb WHERE id = $1::uuid`,
+            [inv.id, JSON.stringify(actualizados)]
+        );
+
+        return res.json({ ok: true });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al eliminar el documento' });
+    }
+});
+
 // ─── RUTA: Health check ───────────────────────────────────────
 app.get('/api/health', async (_, res) => {
     try {
@@ -4825,6 +5609,69 @@ app.get('/api/health', async (_, res) => {
 //  Un solo link por convocatoria → cualquier persona puede postularse
 //  sin tener cuenta en el sistema.
 // ═══════════════════════════════════════════════════════════════
+
+// GET /api/proveedores/buscar-por-documento?documento=...&tipo_persona=empresa|persona
+// Busca el registro RA1-4 (Fase 1) más reciente con ese número de documento, para
+// autocompletar el formulario de registro público a quien ya se ha registrado antes
+// en otra convocatoria. No requiere autenticación (dato público de postulación).
+app.get('/api/proveedores/buscar-por-documento', proponenteRateLimit, async (req, res) => {
+    const { documento, tipo_persona } = req.query;
+    if (!documento || !String(documento).trim()) return res.status(400).json({ error: 'Documento requerido' });
+    if (tipo_persona !== 'empresa' && tipo_persona !== 'persona') return res.status(400).json({ error: 'tipo_persona inválido' });
+
+    try {
+        await ensureConvocatoriasStorage();
+        const result = await pool.query(
+            `SELECT proponente_nombre, proponente_email, telefono, cedula_nit,
+                    tipo_documento, domicilio, pagina_web,
+                    representante_legal_nombre, representante_legal_tipo_id, representante_legal_identificacion,
+                    representante_legal_direccion, representante_legal_autorizado,
+                    ciiu, tarifa, regimen, actividad_economica, municipio_inscripcion,
+                    es_gran_contribuyente, gran_contribuyente_resolucion, gran_contribuyente_fecha,
+                    es_auto_retenedor, auto_retenedor_resolucion, auto_retenedor_fecha,
+                    es_entidad_estado, exento_impuesto_renta
+             FROM convocatoria_invitaciones
+             WHERE cedula_nit = $1 AND tipo_persona = $2 AND tipo_documento IS NOT NULL
+             ORDER BY creado_en DESC
+             LIMIT 1`,
+            [String(documento).trim(), tipo_persona]
+        );
+
+        if (result.rows.length === 0) return res.status(404).json({ encontrado: false });
+
+        const r = result.rows[0];
+        return res.json({
+            encontrado: true,
+            nombre: r.proponente_nombre,
+            email: r.proponente_email,
+            telefono: r.telefono,
+            tipo_documento: r.tipo_documento,
+            domicilio: r.domicilio,
+            pagina_web: r.pagina_web,
+            representante_legal_nombre: r.representante_legal_nombre,
+            representante_legal_tipo_id: r.representante_legal_tipo_id,
+            representante_legal_identificacion: r.representante_legal_identificacion,
+            representante_legal_direccion: r.representante_legal_direccion,
+            representante_legal_autorizado: r.representante_legal_autorizado,
+            ciiu: r.ciiu,
+            tarifa: r.tarifa,
+            regimen: r.regimen,
+            actividad_economica: r.actividad_economica,
+            municipio_inscripcion: r.municipio_inscripcion,
+            es_gran_contribuyente: r.es_gran_contribuyente,
+            gran_contribuyente_resolucion: r.gran_contribuyente_resolucion,
+            gran_contribuyente_fecha: r.gran_contribuyente_fecha,
+            es_auto_retenedor: r.es_auto_retenedor,
+            auto_retenedor_resolucion: r.auto_retenedor_resolucion,
+            auto_retenedor_fecha: r.auto_retenedor_fecha,
+            es_entidad_estado: r.es_entidad_estado,
+            exento_impuesto_renta: r.exento_impuesto_renta,
+        });
+    } catch (err) {
+        console.error('Error buscando proveedor por documento:', err);
+        return res.status(500).json({ error: 'Error al buscar el proveedor' });
+    }
+});
 
 // GET /api/convocatoria-publica/:convocatoria_id
 // Retorna la info pública de la convocatoria si el link está activo y no ha vencido.
@@ -4892,12 +5739,52 @@ app.get('/api/convocatoria-publica/:id', proponenteRateLimit, async (req, res) =
 // Crea una invitación nueva en convocatoria_invitaciones con es_postulacion_publica = TRUE.
 app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (req, res) => {
     const { id } = req.params;
-    const { nombre_empresa, nombre_contacto, nit, nombre_completo, cedula, email, telefono, acepta_tratamiento_datos } = req.body;
+    const {
+        nombre_empresa, nombre_contacto, nit, nombre_completo, cedula, email, telefono, acepta_tratamiento_datos,
+        tipo_documento, domicilio, pagina_web,
+        representante_legal_nombre, representante_legal_tipo_id, representante_legal_identificacion,
+        representante_legal_direccion, representante_legal_autorizado,
+        ciiu, tarifa, regimen, actividad_economica, municipio_inscripcion,
+        es_gran_contribuyente, gran_contribuyente_resolucion, gran_contribuyente_fecha,
+        es_auto_retenedor, auto_retenedor_resolucion, auto_retenedor_fecha,
+        es_entidad_estado, exento_impuesto_renta,
+    } = req.body;
 
-    if (!email) return res.status(400).json({ error: 'El correo electrónico es obligatorio.' });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'El correo electrónico no es válido.' });
-    if (!nombre_empresa && !nombre_completo) return res.status(400).json({ error: 'El nombre es obligatorio.' });
-    if (acepta_tratamiento_datos !== true) return res.status(400).json({ error: 'Debes aceptar la Política de Tratamiento de Datos Personales para continuar.' });
+    const esBool = v => v === 'true' || v === true;
+    const fallar = (status, error) => res.status(status).json({ error });
+
+    const tipoPersona = nombre_completo ? 'persona' : 'empresa';
+    const numeroDocumento = tipoPersona === 'persona' ? cedula : nit;
+
+    if (!email) return fallar(400, 'El correo electrónico es obligatorio.');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fallar(400, 'El correo electrónico no es válido.');
+    if (!nombre_empresa && !nombre_completo) return fallar(400, 'El nombre o razón social es obligatorio.');
+    if (acepta_tratamiento_datos !== true) return fallar(400, 'Debes aceptar la Política de Tratamiento de Datos Personales para continuar.');
+
+    // ── Validación de campos del formulario RA1-4 (identificación y datos tributarios — obligatorios en Fase 1) ──
+    const camposTexto = {
+        'Tipo de documento': tipo_documento, 'Número de documento': numeroDocumento,
+        'Domicilio': domicilio, 'Teléfono': telefono, 'Página web': pagina_web,
+        'CIIU': ciiu, 'Tarifa': tarifa, 'Régimen': regimen,
+        'Actividad económica': actividad_economica, 'Municipio donde está inscrito': municipio_inscripcion,
+    };
+    for (const [label, valor] of Object.entries(camposTexto)) {
+        if (!valor || !String(valor).trim()) return fallar(400, `El campo "${label}" es obligatorio.`);
+    }
+    if (es_gran_contribuyente === undefined || es_auto_retenedor === undefined || es_entidad_estado === undefined || exento_impuesto_renta === undefined) {
+        return fallar(400, 'Debes responder todas las preguntas de estado tributario.');
+    }
+    if (esBool(es_gran_contribuyente) && (!gran_contribuyente_resolucion?.trim() || !gran_contribuyente_fecha)) {
+        return fallar(400, 'Debes indicar la Resolución y Fecha de Gran Contribuyente.');
+    }
+    if (esBool(es_auto_retenedor) && (!auto_retenedor_resolucion?.trim() || !auto_retenedor_fecha)) {
+        return fallar(400, 'Debes indicar la Resolución y Fecha de Auto Retenedor.');
+    }
+    if (tipoPersona === 'empresa') {
+        if (!representante_legal_nombre?.trim() || !representante_legal_tipo_id?.trim() || !representante_legal_identificacion?.trim() || !representante_legal_direccion?.trim()) {
+            return fallar(400, 'Los datos del representante legal son obligatorios.');
+        }
+    }
 
     const client = await pool.connect();
     try {
@@ -4911,7 +5798,7 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
         );
         if (convRes.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Convocatoria no encontrada.' });
+            return fallar(404, 'Convocatoria no encontrada.');
         }
         const conv = convRes.rows[0];
         // Verificar si la Fase 2 ya fue enviada (cierre automático del registro público)
@@ -4937,7 +5824,7 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
         );
         if (duplicado.rows.length > 0) {
             await client.query('ROLLBACK');
-            return res.status(409).json({ error: 'Ya existe una postulación registrada con ese correo para esta convocatoria.' });
+            return fallar(409, 'Ya existe una postulación registrada con ese correo para esta convocatoria.');
         }
 
         // Crear token único para el postulante
@@ -4945,18 +5832,10 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
         const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
 
         // Construir nombre y cédula/NIT según el tipo de proponente
-        let nombreRegistro, cedulaNit, tipoPersona;
-        if (nombre_completo) {
-            // Persona natural
-            nombreRegistro = nombre_completo.trim();
-            cedulaNit = cedula || null;
-            tipoPersona = 'persona';
-        } else {
-            // Empresa
-            nombreRegistro = nombre_contacto ? `${nombre_empresa} — ${nombre_contacto}` : nombre_empresa;
-            cedulaNit = nit || null;
-            tipoPersona = 'empresa';
-        }
+        const nombreRegistro = tipoPersona === 'persona'
+            ? nombre_completo.trim()
+            : (nombre_contacto ? `${nombre_empresa} — ${nombre_contacto}` : nombre_empresa);
+        const cedulaNit = numeroDocumento || null;
 
         const invRes = await client.query(
             `INSERT INTO convocatoria_invitaciones
@@ -4964,10 +5843,35 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
                  es_postulacion_publica, telefono, cedula_nit, tipo_persona,
                  primer_acceso_en, ip_acceso, total_accesos,
                  respondida, respuesta_archivos,
-                 acepta_tratamiento_datos, acepta_tratamiento_datos_en)
-             VALUES ($1::uuid, $2, $3, $4, TRUE, $5, $6, $7, NOW(), $8, 1, FALSE, '[]'::jsonb, TRUE, NOW())
+                 acepta_tratamiento_datos, acepta_tratamiento_datos_en,
+                 tipo_documento, domicilio, pagina_web,
+                 representante_legal_nombre, representante_legal_tipo_id, representante_legal_identificacion,
+                 representante_legal_direccion, representante_legal_autorizado,
+                 ciiu, tarifa, regimen, actividad_economica, municipio_inscripcion,
+                 es_gran_contribuyente, gran_contribuyente_resolucion, gran_contribuyente_fecha,
+                 es_auto_retenedor, auto_retenedor_resolucion, auto_retenedor_fecha,
+                 es_entidad_estado, exento_impuesto_renta)
+             VALUES ($1::uuid, $2, $3, $4, TRUE, $5, $6, $7, NOW(), $8, 1, FALSE, '[]'::jsonb, TRUE, NOW(),
+                 $9, $10, $11,
+                 $12, $13, $14, $15, $16,
+                 $17, $18, $19, $20, $21,
+                 $22, $23, $24,
+                 $25, $26, $27,
+                 $28, $29)
              RETURNING id, token`,
-            [id, email.toLowerCase().trim(), nombreRegistro, token, telefono || null, cedulaNit, tipoPersona, ip]
+            [
+                id, email.toLowerCase().trim(), nombreRegistro, token, telefono || null, cedulaNit, tipoPersona, ip,
+                tipo_documento.trim(), domicilio.trim(), pagina_web.trim(),
+                tipoPersona === 'empresa' ? representante_legal_nombre.trim() : null,
+                tipoPersona === 'empresa' ? representante_legal_tipo_id.trim() : null,
+                tipoPersona === 'empresa' ? representante_legal_identificacion.trim() : null,
+                tipoPersona === 'empresa' ? representante_legal_direccion.trim() : null,
+                tipoPersona === 'empresa' ? (representante_legal_autorizado || '').trim() || null : null,
+                ciiu.trim(), tarifa.trim(), regimen.trim(), actividad_economica.trim(), municipio_inscripcion.trim(),
+                esBool(es_gran_contribuyente), esBool(es_gran_contribuyente) ? gran_contribuyente_resolucion.trim() : null, esBool(es_gran_contribuyente) ? gran_contribuyente_fecha : null,
+                esBool(es_auto_retenedor), esBool(es_auto_retenedor) ? auto_retenedor_resolucion.trim() : null, esBool(es_auto_retenedor) ? auto_retenedor_fecha : null,
+                esBool(es_entidad_estado), esBool(exento_impuesto_renta),
+            ]
         );
 
         await client.query('COMMIT');
@@ -4990,6 +5894,111 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
 // POST /api/convocatorias/:id/enviar-fase1
 // Envía el link público de registro a todos los proponentes conocidos (Fase 1).
 // No envía el link de propuesta — solo invita a registrarse antes de fecha_limite_registro.
+// ─── Envío de correo institucional a proponentes ────────────────────────────
+// Orden de preferencia:
+//   1) Microsoft Graph (app-only, mismas credenciales AZURE_* que usa SharePoint)
+//      — recomendado: aprovecha el SPF/DKIM ya configurado del dominio de Invest in Bogotá,
+//        necesario para que dominios externos (Gmail, Outlook, etc.) no rechacen el correo.
+//   2) SMTP tradicional (SMTP_USER/SMTP_PASS) — alternativa si no se usa Microsoft Graph.
+//   3) Cuenta de prueba Ethereal — último recurso; NO entrega correos reales,
+//      solo genera una URL de vista previa. Se reporta explícitamente como modo "prueba".
+let _graphMailToken = { token: null, exp: 0 };
+async function obtenerTokenGraphMail() {
+    const ahora = Date.now();
+    if (_graphMailToken.token && ahora < _graphMailToken.exp - 60_000) return _graphMailToken.token;
+    const tenantId = process.env.AZURE_TENANT_ID;
+    const clientId = process.env.AZURE_CLIENT_ID;
+    const clientSecret = process.env.AZURE_CLIENT_SECRET;
+    const tokenRes = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            client_id: clientId,
+            scope: 'https://graph.microsoft.com/.default',
+            client_secret: clientSecret,
+            grant_type: 'client_credentials',
+        }),
+    }).then(r => r.json());
+    if (!tokenRes.access_token) {
+        throw new Error('No se pudo obtener token de Microsoft Graph para envío de correo: ' + (tokenRes.error_description || JSON.stringify(tokenRes)));
+    }
+    _graphMailToken = { token: tokenRes.access_token, exp: ahora + (tokenRes.expires_in || 3600) * 1000 };
+    return tokenRes.access_token;
+}
+
+async function prepararEnvioCorreo() {
+    if (process.env.AZURE_TENANT_ID && process.env.AZURE_CLIENT_ID && process.env.AZURE_CLIENT_SECRET && process.env.GRAPH_MAIL_SENDER) {
+        const token = await obtenerTokenGraphMail();
+        const sender = process.env.GRAPH_MAIL_SENDER;
+        return {
+            modo: 'real',
+            proveedor: 'graph',
+            enviar: async ({ to, subject, html, attachments = [] }) => {
+                const graphAttachments = attachments.map(a => ({
+                    '@odata.type': '#microsoft.graph.fileAttachment',
+                    name: a.filename,
+                    contentBytes: fs.readFileSync(a.path).toString('base64'),
+                }));
+                const resp = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}/sendMail`, {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: {
+                            subject,
+                            body: { contentType: 'HTML', content: html },
+                            toRecipients: [{ emailAddress: { address: to } }],
+                            attachments: graphAttachments,
+                        },
+                        saveToSentItems: true,
+                    }),
+                });
+                if (!resp.ok) {
+                    const errText = await resp.text().catch(() => '');
+                    throw new Error(`Microsoft Graph sendMail falló (${resp.status}): ${errText}`);
+                }
+                return {};
+            },
+        };
+    }
+
+    if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+        const transporter = nodemailer.createTransport({
+            host: process.env.SMTP_HOST || 'smtp.gmail.com',
+            port: parseInt(process.env.SMTP_PORT || '587'),
+            secure: process.env.SMTP_SECURE === 'true',
+            auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+        });
+        return {
+            modo: 'real',
+            proveedor: 'smtp',
+            enviar: async ({ to, subject, html, attachments = [] }) => {
+                await transporter.sendMail({
+                    from: `"Invest in Bogotá" <${process.env.SMTP_USER}>`,
+                    to, subject, html, attachments,
+                });
+                return {};
+            },
+        };
+    }
+
+    const testAccount = await nodemailer.createTestAccount();
+    const transporter = nodemailer.createTransport({
+        host: 'smtp.ethereal.email', port: 587, secure: false,
+        auth: { user: testAccount.user, pass: testAccount.pass },
+    });
+    return {
+        modo: 'prueba',
+        proveedor: 'ethereal',
+        enviar: async ({ to, subject, html, attachments = [] }) => {
+            const info = await transporter.sendMail({
+                from: `"Invest in Bogotá (PRUEBA — no configurado)" <${testAccount.user}>`,
+                to, subject, html, attachments,
+            });
+            return { previewUrl: nodemailer.getTestMessageUrl(info) };
+        },
+    };
+}
+
 app.post('/api/convocatorias/:id/enviar-fase1', async (req, res) => {
     const { id } = req.params;
     const { usuario_email } = req.body || {};
@@ -5023,30 +6032,12 @@ app.post('/api/convocatorias/:id/enviar-fase1', async (req, res) => {
             ? new Date(conv.fecha_limite_registro).toLocaleString('es-CO', { day: '2-digit', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })
             : '';
 
-        // Configurar transporter
-        let transporter;
-        let isTestAccount = false;
-        if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-            transporter = nodemailer.createTransport({
-                host: process.env.SMTP_HOST || 'smtp.gmail.com',
-                port: parseInt(process.env.SMTP_PORT || '587'),
-                secure: process.env.SMTP_SECURE === 'true',
-                auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-            });
-        } else {
-            const testAccount = await nodemailer.createTestAccount();
-            isTestAccount = true;
-            transporter = nodemailer.createTransport({
-                host: 'smtp.ethereal.email', port: 587, secure: false,
-                auth: { user: testAccount.user, pass: testAccount.pass },
-            });
-        }
+        const envio = await prepararEnvioCorreo();
 
         const previews = [];
         await Promise.all(invRes.rows.map(async inv => {
             try {
-                const info = await transporter.sendMail({
-                    from: `"Invest in Bogotá" <${process.env.SMTP_USER || 'compras@investinbogota.org'}>`,
+                const resultado = await envio.enviar({
                     to: inv.proponente_email,
                     subject: `Invitación a registrarse — ${conv.asunto}`,
                     html: `
@@ -5078,18 +6069,18 @@ app.post('/api/convocatorias/:id/enviar-fase1', async (req, res) => {
                                 </div>
                                 ${conv.descripcion_publica ? `
                                 <div style="margin-bottom:24px;padding:16px 18px;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;">
-                                    <p style="margin:0;font-size:13px;color:#1e40af;line-height:1.6;">${conv.descripcion_publica}</p>
+                                    <p style="margin:0;font-size:13px;color:#245782;line-height:1.6;">${conv.descripcion_publica}</p>
                                 </div>` : ''}
                                 <p style="font-size:14px;color:#334155;margin:0 0 8px;line-height:1.6;">
                                     Para registrarse, haga clic en el siguiente enlace <strong>antes de la fecha límite</strong>. El registro solo requiere sus datos básicos — la propuesta formal se entregará en una etapa posterior.
                                 </p>
                                 <div style="text-align:center;margin:28px 0;">
                                     <a href="${linkPublico}" target="_blank"
-                                       style="background-color:#3384D6;color:#fff;padding:16px 36px;text-decoration:none;border-radius:10px;font-weight:800;display:inline-block;font-size:15px;">
+                                       style="background-color:#E84922;color:#fff;padding:16px 36px;text-decoration:none;border-radius:10px;font-weight:800;display:inline-block;font-size:15px;">
                                         Registrarme en esta convocatoria
                                     </a>
                                 </div>
-                                <p style="text-align:center;font-size:11px;color:#3384D6;word-break:break-all;margin:0 0 24px;">${linkPublico}</p>
+                                <p style="text-align:center;font-size:11px;color:#245782;word-break:break-all;margin:0 0 24px;">${linkPublico}</p>
                                 <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px 16px;">
                                     <p style="margin:0;font-size:12px;color:#92400e;line-height:1.6;">
                                         ⚠️ Este enlace es público. Registrarse no garantiza la adjudicación.<br/>
@@ -5101,12 +6092,11 @@ app.post('/api/convocatorias/:id/enviar-fase1', async (req, res) => {
                                 <p style="margin:0;font-size:11px;color:#94a3b8;">Portal de Compras y Contratación — Invest in Bogotá · Bogotá, Colombia</p>
                             </div>
                         </div>
-                    `
+                    `,
                 });
-                if (isTestAccount) {
-                    const url = nodemailer.getTestMessageUrl(info);
-                    previews.push({ email: inv.proponente_email, preview: url });
-                    console.log(`✅ Fase1 demo email → ${inv.proponente_email} | ${url}`);
+                if (envio.modo === 'prueba') {
+                    previews.push({ email: inv.proponente_email, preview: resultado?.previewUrl });
+                    console.log(`⚠️ Fase1 en modo PRUEBA (no llega al correo real) → ${inv.proponente_email} | ${resultado?.previewUrl}`);
                 }
             } catch (e) {
                 console.error(`❌ Error enviando Fase1 a ${inv.proponente_email}:`, e);
@@ -5133,6 +6123,7 @@ app.post('/api/convocatorias/:id/enviar-fase1', async (req, res) => {
             ok: true,
             total_notificados: invRes.rows.length,
             mensaje: `Notificación de Fase 1 enviada a ${invRes.rows.length} proponente(s) conocido(s).`,
+            modo_envio: envio.modo,
             previews,
         });
     } catch (err) {
@@ -5276,24 +6267,8 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
             enlace: `${FRONTEND_URL}/respuesta-proponente?token=${inv.token}`
         }));
 
-        // 5. Configurar transporter
-        let transporter;
-        let isTestAccount = false;
-        if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-            transporter = nodemailer.createTransport({
-                host: process.env.SMTP_HOST || 'smtp.gmail.com',
-                port: parseInt(process.env.SMTP_PORT || '587'),
-                secure: process.env.SMTP_SECURE === 'true',
-                auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-            });
-        } else {
-            const testAccount = await nodemailer.createTestAccount();
-            isTestAccount = true;
-            transporter = nodemailer.createTransport({
-                host: 'smtp.ethereal.email', port: 587, secure: false,
-                auth: { user: testAccount.user, pass: testAccount.pass },
-            });
-        }
+        // 5. Preparar canal de envío de correo
+        const envio = await prepararEnvioCorreo();
 
         // 6. Marcar link_enviado_en + registrar que la Fase 2 fue enviada + cerrar registro público
         await pool.query(
@@ -5327,8 +6302,7 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
         const previews = [];
         await Promise.all(enlacesParaEnviar.map(async inv => {
             try {
-                const info = await transporter.sendMail({
-                    from: `"Invest in Bogotá" <${process.env.SMTP_USER || 'compras@investinbogota.org'}>`,
+                const resultado = await envio.enviar({
                     to: inv.proponente_email,
                     subject: `Invitación a presentar propuesta — ${conv.asunto}`,
                     html: `
@@ -5377,7 +6351,7 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
                                     <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:14px 18px;display:flex;align-items:flex-start;gap:12px;">
                                         <span style="font-size:20px;flex-shrink:0;">📎</span>
                                         <div>
-                                            <p style="margin:0 0 2px;font-size:13px;font-weight:700;color:#1D4ED8;">${conv.documento_adjunto_nombre || 'Documento adjunto'}</p>
+                                            <p style="margin:0 0 2px;font-size:13px;font-weight:700;color:#245782;">${conv.documento_adjunto_nombre || 'Documento adjunto'}</p>
                                             <p style="margin:0;font-size:12px;color:#334155;line-height:1.5;">Encuentra el archivo adjunto en este correo.</p>
                                         </div>
                                     </div>
@@ -5391,7 +6365,7 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
                                     </a>
                                 </div>
                                 <p style="text-align:center;font-size:12px;color:#94a3b8;margin:0 0 8px;">O copia este enlace en tu navegador:</p>
-                                <p style="text-align:center;font-size:11px;color:#3384D6;word-break:break-all;margin:0 0 32px;">${inv.enlace}</p>
+                                <p style="text-align:center;font-size:11px;color:#245782;word-break:break-all;margin:0 0 32px;">${inv.enlace}</p>
 
                                 <!-- Aviso -->
                                 <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px 16px;">
@@ -5409,10 +6383,9 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
                     `,
                     attachments: docAttachments,
                 });
-                if (isTestAccount) {
-                    const url = nodemailer.getTestMessageUrl(info);
-                    previews.push({ email: inv.proponente_email, preview: url });
-                    console.log(`✅ Demo email → ${inv.proponente_email} | ${url}`);
+                if (envio.modo === 'prueba') {
+                    previews.push({ email: inv.proponente_email, preview: resultado?.previewUrl });
+                    console.log(`⚠️ Fase2 en modo PRUEBA (no llega al correo real) → ${inv.proponente_email} | ${resultado?.previewUrl}`);
                 } else {
                     console.log(`✅ Email enviado → ${inv.proponente_email}`);
                 }
@@ -5436,6 +6409,7 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
             total_enviados: enlacesParaEnviar.length,
             nuevos_agregados: nuevasInvitaciones.length,
             mensaje: `Invitación enviada a ${enlacesParaEnviar.length} proponente(s). ${nuevasInvitaciones.length} nuevo(s) agregado(s) desde la solicitud.`,
+            modo_envio: envio.modo,
             invitaciones: enlacesParaEnviar,
             previews,
         });
@@ -5479,27 +6453,9 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
         const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
         const enlace = `${FRONTEND_URL}/respuesta-proponente?token=${inv.token}`;
 
-        // Configurar transporter
-        let transporter;
-        let isTestAccount = false;
-        if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-            transporter = nodemailer.createTransport({
-                host: process.env.SMTP_HOST || 'smtp.gmail.com',
-                port: parseInt(process.env.SMTP_PORT || '587'),
-                secure: process.env.SMTP_SECURE === 'true',
-                auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-            });
-        } else {
-            const testAccount = await nodemailer.createTestAccount();
-            isTestAccount = true;
-            transporter = nodemailer.createTransport({
-                host: 'smtp.ethereal.email', port: 587, secure: false,
-                auth: { user: testAccount.user, pass: testAccount.pass },
-            });
-        }
+        const envio = await prepararEnvioCorreo();
 
-        const info = await transporter.sendMail({
-            from: `"Invest in Bogotá" <${process.env.SMTP_USER || 'compras@investinbogota.org'}>`,
+        const resultado = await envio.enviar({
             to: inv.proponente_email,
             subject: `Invitación a presentar propuesta — ${inv.asunto}`,
             html: `
@@ -5541,7 +6497,7 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
                             </a>
                         </div>
                         <p style="text-align:center;font-size:12px;color:#94a3b8;margin:0 0 8px;">O copia este enlace en tu navegador:</p>
-                        <p style="text-align:center;font-size:11px;color:#3384D6;word-break:break-all;margin:0 0 32px;">${enlace}</p>
+                        <p style="text-align:center;font-size:11px;color:#245782;word-break:break-all;margin:0 0 32px;">${enlace}</p>
                         <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px 16px;">
                             <p style="margin:0;font-size:12px;color:#92400e;line-height:1.6;">
                                 ⚠️ <strong>Este enlace es personal e intransferible.</strong> No lo comparta con terceros.<br/>
@@ -5553,12 +6509,12 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
                         <p style="margin:0;font-size:11px;color:#94a3b8;">Portal de Compras y Contratación — Invest in Bogotá · Bogotá, Colombia</p>
                     </div>
                 </div>
-            `
+            `,
         });
 
-        if (isTestAccount) {
-            console.log(`\n✅ Correo demo enviado a ${inv.proponente_email}`);
-            console.log(`👀 Vista previa: ${nodemailer.getTestMessageUrl(info)}\n`);
+        if (envio.modo === 'prueba') {
+            console.log(`\n⚠️ Reenvío en modo PRUEBA (no llega al correo real) → ${inv.proponente_email}`);
+            console.log(`👀 Vista previa: ${resultado?.previewUrl}\n`);
         }
 
         // Marcar que el link fue enviado
@@ -5580,7 +6536,8 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
             ok: true,
             mensaje: `Enlace enviado a ${inv.proponente_email}`,
             enlace,
-            preview: isTestAccount ? nodemailer.getTestMessageUrl(info) : null,
+            modo_envio: envio.modo,
+            preview: envio.modo === 'prueba' ? resultado?.previewUrl : null,
         });
     } catch (err) {
         console.error('Error enviando link individual:', err);
@@ -5665,6 +6622,19 @@ app.put('/api/convocatorias/:id/link-publico', async (req, res) => {
     }
 })();
 
+// ─── Migración: proveedor y método de pago en facturas ───────
+(async () => {
+    try {
+        await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS nombre_proveedor VARCHAR(255)`);
+        await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS metodo_pago VARCHAR(20) CHECK (metodo_pago IN ('pse','tarjeta','transferencia'))`);
+        await pool.query(`ALTER TABLE facturas_contrato ADD COLUMN IF NOT EXISTS numero_ap VARCHAR(100)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_facturas_contrato_numero_ap ON facturas_contrato(numero_ap)`);
+        console.log('✓ Columnas nombre_proveedor/metodo_pago/numero_ap verificadas en facturas_contrato');
+    } catch (e) {
+        console.error('Advertencia al verificar columnas proveedor/metodo_pago:', e.message);
+    }
+})();
+
 // ─── Migración: columnas faltantes en solicitudes ─────────────
 (async () => {
     try {
@@ -5718,6 +6688,13 @@ app.put('/api/convocatorias/:id/link-publico', async (req, res) => {
         await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'finalizado'`);
         await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'aprobado_comite'`);
         await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'rechazado_comite'`);
+
+        // Flujo Riesgos: Jurídica (concepto) → Riesgos (si aplica) → Comité → Jurídica (resto)
+        await pool.query(`ALTER TYPE rol_usuario ADD VALUE IF NOT EXISTS 'riesgos'`);
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'en_juridica_concepto'`);
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'en_riesgos'`);
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'rechazado_riesgos'`);
+        await pool.query(`ALTER TYPE estado_solicitud ADD VALUE IF NOT EXISTS 'en_comite'`);
 
         console.log('✓ Columnas financiera, rubros_presupuestales y enum estados verificados');
     } catch (e) {
@@ -5786,9 +6763,10 @@ app.put('/api/convocatorias/:id/link-publico', async (req, res) => {
 app.get('/api/financiera/facturas-aprobadas', async (_req, res) => {
     try {
         const result = await pool.query(
-            `SELECT fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.concepto, fc.valor,
+            `SELECT fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.numero_ap, fc.concepto, fc.valor,
+                    fc.nombre_proveedor,
                     fc.fecha_factura, fc.estado, fc.aprobado_supervisor, fc.aprobado_gerente,
-                    fc.pagado_financiera, fc.fecha_pago_financiera, fc.confirmado_por_financiera,
+                    fc.pagado_financiera, fc.fecha_pago_financiera, fc.confirmado_por_financiera, fc.metodo_pago,
                     fc.creado_en, fc.actualizado_en,
                     s.id AS solicitud_id, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto
              FROM facturas_contrato fc
@@ -5803,15 +6781,20 @@ app.get('/api/financiera/facturas-aprobadas', async (_req, res) => {
     }
 });
 
+const METODOS_PAGO_VALIDOS = ['pse', 'tarjeta', 'transferencia'];
+
 // PATCH /api/financiera/facturas/:id/marcar-pago — financiera confirma el pago con fecha
 app.patch('/api/financiera/facturas/:id/marcar-pago', async (req, res) => {
     const { id } = req.params;
-    const { pagado, fecha_pago, confirmado_por } = req.body;
+    const { pagado, fecha_pago, confirmado_por, metodo_pago } = req.body;
     if (typeof pagado !== 'boolean') {
         return res.status(400).json({ error: '"pagado" debe ser true o false' });
     }
     if (pagado && !fecha_pago) {
         return res.status(400).json({ error: 'La fecha de pago es requerida al confirmar pago' });
+    }
+    if (pagado && metodo_pago && !METODOS_PAGO_VALIDOS.includes(metodo_pago)) {
+        return res.status(400).json({ error: 'metodo_pago debe ser pse, tarjeta o transferencia' });
     }
     try {
         const result = await pool.query(
@@ -5819,15 +6802,47 @@ app.patch('/api/financiera/facturas/:id/marcar-pago', async (req, res) => {
              SET pagado_financiera=$1,
                  fecha_pago_financiera=$2,
                  confirmado_por_financiera=$3,
+                 metodo_pago=$4,
                  actualizado_en=NOW()
-             WHERE id=$4 RETURNING *`,
-            [pagado, pagado ? fecha_pago : null, confirmado_por || null, id]
+             WHERE id=$5 RETURNING *`,
+            [pagado, pagado ? fecha_pago : null, confirmado_por || null, pagado ? (metodo_pago || null) : null, id]
         );
         if (!result.rows.length) return res.status(404).json({ error: 'Factura no encontrada' });
         return res.json(result.rows[0]);
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al confirmar pago' });
+    }
+});
+
+// PATCH /api/financiera/facturas/pagar-lote — financiera confirma el pago de varias facturas a la vez
+app.patch('/api/financiera/facturas/pagar-lote', async (req, res) => {
+    const { ids, fecha_pago, metodo_pago, confirmado_por } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ error: '"ids" debe ser un arreglo con al menos una factura' });
+    }
+    if (!fecha_pago) {
+        return res.status(400).json({ error: 'La fecha de pago es requerida' });
+    }
+    if (!METODOS_PAGO_VALIDOS.includes(metodo_pago)) {
+        return res.status(400).json({ error: 'metodo_pago debe ser pse, tarjeta o transferencia' });
+    }
+    try {
+        const result = await pool.query(
+            `UPDATE facturas_contrato
+             SET pagado_financiera=TRUE,
+                 fecha_pago_financiera=$1,
+                 metodo_pago=$2,
+                 confirmado_por_financiera=$3,
+                 actualizado_en=NOW()
+             WHERE id = ANY($4::uuid[]) AND estado='aprobada'
+             RETURNING *`,
+            [fecha_pago, metodo_pago, confirmado_por || null, ids]
+        );
+        return res.json({ facturas: result.rows, actualizadas: result.rows.length });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al confirmar el pago por lote' });
     }
 });
 

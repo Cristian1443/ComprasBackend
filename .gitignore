@@ -13,6 +13,7 @@ uploads/juridica/*
 uploads/facturas/*
 uploads/firmas/*
 uploads/actas/*
+uploads/reconocimientos/*
 !uploads/**/.gitkeep
 
 # Logs

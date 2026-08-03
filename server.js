@@ -4742,13 +4742,16 @@ app.put('/api/admin/permisos-pantallas', requireRole('administrador'), async (re
 
         const permisosSanitizados = sanitizeScreenPermissions(permisos);
         const permissionsMap = await getUserScreenPermissionsMap();
+        const permisosAnteriores = sanitizeScreenPermissions(permissionsMap[emailKey] || []);
         permissionsMap[emailKey] = permisosSanitizados;
         await saveUserScreenPermissionsMap(permissionsMap);
 
         await registrarLog({
             tipo_log: 'seguridad', modulo: 'administracion', tabla: 'permisos_pantallas',
             registro_id: '00000000-0000-0000-0000-000000000002', accion: 'UPDATE',
-            campo: 'permisos', valor_anterior: null, valor_nuevo: permisosSanitizados.join(','),
+            campo: 'permisos',
+            valor_anterior: permisosAnteriores.join(',') || null,
+            valor_nuevo: permisosSanitizados.join(','),
             descripcion: `${req.auth.email} actualizó permisos de pantalla para: ${emailKey}`,
             usuario_id: req.auth.usuarioId, rol_usuario: req.auth.rol,
             ip_address: getClientIp(req), resultado: 'exitoso'
@@ -4785,13 +4788,16 @@ app.put('/api/admin/usuarios/:id/permisos-pantallas', requireRole('administrador
         const permisosSanitizados = sanitizeScreenPermissions(permisos);
 
         const permissionsMap = await getUserScreenPermissionsMap();
+        const permisosAnteriores = sanitizeScreenPermissions(permissionsMap[emailKey] || []);
         permissionsMap[emailKey] = permisosSanitizados;
         await saveUserScreenPermissionsMap(permissionsMap);
 
         await registrarLog({
             tipo_log: 'seguridad', modulo: 'administracion', tabla: 'permisos_pantallas',
             registro_id: user.id, accion: 'UPDATE',
-            campo: 'permisos', valor_anterior: null, valor_nuevo: permisosSanitizados.join(','),
+            campo: 'permisos',
+            valor_anterior: permisosAnteriores.join(',') || null,
+            valor_nuevo: permisosSanitizados.join(','),
             descripcion: `${req.auth.email} actualizó permisos de pantalla para: ${emailKey}`,
             usuario_id: req.auth.usuarioId, rol_usuario: req.auth.rol,
             ip_address: getClientIp(req), resultado: 'exitoso'

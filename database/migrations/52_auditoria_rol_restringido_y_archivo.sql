@@ -28,7 +28,11 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
-GRANT CONNECT ON DATABASE compras_db TO compras_app_rw;
+-- current_database() en vez de un nombre fijo: el nombre real difiere por
+-- ambiente (compras_db en local, compras_db_qa en QA, etc.)
+DO $$ BEGIN
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO compras_app_rw', current_database());
+END $$;
 GRANT USAGE ON SCHEMA public TO compras_app_rw;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO compras_app_rw;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO compras_app_rw;

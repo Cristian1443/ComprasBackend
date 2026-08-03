@@ -15,6 +15,8 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
 import { registrarRutasFirmas } from './routes/firmas.js';
+import { crearMiddlewareAuth } from './middleware/auth.js';
+import { iniciarArchivadoAuditoria } from './jobs/archivarAuditoria.js';
 
 dotenv.config();
 
@@ -123,9 +125,32 @@ const DOCUMENTOS_PROVEEDOR_LABELS = {
     certificacion_bancaria: 'Certificación bancaria',
 };
 
+// ─── Conexión PostgreSQL ───────────────────────────────────────
+// (se crea antes que `app` porque el middleware de autenticación,
+// montado más abajo justo después de CORS, necesita el pool ya listo)
+const pool = new pg.Pool({
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432'),
+    database: process.env.DB_NAME || 'compras_db',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || '1443',
+    max: 10,
+    idleTimeoutMillis: 30000,
+});
+
 const app = express();
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+
+// No confiar en X-Forwarded-For salvo que se confirme un proxy real delante
+// (ver TRUST_PROXY en .env.example). Por defecto usa la IP del socket.
+app.set('trust proxy', (() => {
+    const v = String(process.env.TRUST_PROXY || '').trim().toLowerCase();
+    if (!v || v === 'false') return false;
+    if (v === 'true') return true;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : false;
+})());
 
 // CORS ampliado: acepta cualquier localhost (Vite, TS server, etc.)
 const allowedOrigins = [
@@ -150,6 +175,13 @@ app.use(cors({
 
 // Servir archivos subidos como estáticos
 app.use('/api/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// ─── Autenticación (Azure AD) ─────────────────────────────────
+// A partir de aquí, toda ruta requiere un Bearer token válido salvo las
+// explícitamente públicas (proponentes externos, health check, callback
+// OAuth de Adobe Sign) — ver middleware/auth.js.
+const { requireAuth, requireRole } = crearMiddlewareAuth({ pool, registrarLog, getClientIp });
+app.use(requireAuth);
 
 // ─── RUTA: Subir anexos del solicitante ───────────────────────
 // POST /api/solicitudes/upload
@@ -215,24 +247,12 @@ app.post('/api/solicitudes/:id/anexos', (req, res, next) => {
     }
 });
 
-// ─── Conexión PostgreSQL ───────────────────────────────────────
-const pool = new pg.Pool({
-    host: process.env.DB_HOST || 'localhost',
-    port: parseInt(process.env.DB_PORT || '5432'),
-    database: process.env.DB_NAME || 'compras_db',
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || '1443',
-    max: 10,
-    idleTimeoutMillis: 30000,
-});
-
 // ─── Rate limiting para rutas públicas de proponentes ─────────
 // Protege contra fuerza bruta de tokens: máx MAX_RPM peticiones/minuto por IP
 const _rl = new Map(); // ip -> { count, resetAt }
 const MAX_RPM = parseInt(process.env.RATE_LIMIT_RPM || '60');
 function proponenteRateLimit(req, res, next) {
-    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
-        .split(',')[0].trim();
+    const ip = getClientIp(req);
     const now = Date.now();
     const entry = _rl.get(ip) || { count: 0, resetAt: now + 60_000 };
     if (now > entry.resetAt) { entry.count = 1; entry.resetAt = now + 60_000; }
@@ -269,9 +289,11 @@ pool.connect((err) => {
 });
 
 // ─── Utilidades de Auditoría ──────────────────────────────────
+// req.ip respeta `trust proxy` (ver arriba): por defecto ignora
+// X-Forwarded-For y usa la IP real del socket, para que no sea
+// falsificable por el cliente cuando no hay proxy confiable delante.
 function getClientIp(req) {
-    return (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '0.0.0.0')
-        .split(',')[0].trim();
+    return req.ip || req.socket?.remoteAddress || '0.0.0.0';
 }
 
 /** Busca usuario por email; devuelve { id, rol } o null sin lanzar excepción. */
@@ -315,6 +337,9 @@ try {
     console.error('[firmas] No se pudieron registrar las rutas de firma:', e.message);
 }
 
+// ─── Archivado (no destructivo) de logs de auditoría vencidos ─
+iniciarArchivadoAuditoria(pool, registrarLog);
+
 /**
  * Devuelve la etapa de firma asociada a un cambio de estado.
  * Solo el comité mantiene firma electrónica; gerente, financiera y jurídica
@@ -357,6 +382,21 @@ app.post('/api/auth/sync', async (req, res) => {
         return res.status(400).json({ error: 'azure_id, email y nombre son requeridos' });
     }
 
+    // El body lo autodeclara el cliente; debe coincidir con la identidad ya
+    // verificada del token (req.auth) para no permitir que alguien sincronice
+    // datos a nombre de otro usuario.
+    const mismaIdentidad = req.auth?.oid === azure_id
+        && String(req.auth?.email || '').toLowerCase() === String(email).toLowerCase();
+    if (!mismaIdentidad) {
+        await registrarLog({
+            tipo_log: 'seguridad', modulo: 'autenticacion', tabla: 'usuarios',
+            registro_id: '00000000-0000-0000-0000-000000000003', accion: 'LOGIN',
+            descripcion: `Intento de sincronizar identidad no coincidente con el token: body=${email}/${azure_id}, token=${req.auth?.email}/${req.auth?.oid}`,
+            ip_address: getClientIp(req), resultado: 'fallido'
+        });
+        return res.status(403).json({ error: 'La identidad enviada no coincide con la sesión autenticada' });
+    }
+
     try {
         const result = await pool.query(
             `SELECT * FROM sincronizar_usuario($1, $2, $3, $4, $5)`,
@@ -388,9 +428,10 @@ app.post('/api/auth/sync', async (req, res) => {
 });
 
 // ─── RUTA: Obtener perfil del usuario actual ─────────────────
-// GET /api/usuarios/me?email=xxx@investinbogota.org
+// GET /api/usuarios/me — el email viene de la identidad ya verificada del token,
+// nunca del query string (evita que alguien consulte el perfil de otro usuario).
 app.get('/api/usuarios/me', async (req, res) => {
-    const { email } = req.query;
+    const email = req.auth?.email;
     if (!email) return res.status(400).json({ error: 'email requerido' });
 
     try {
@@ -4637,7 +4678,7 @@ async function saveUserScreenPermissionsMap(map) {
 }
 
 // GET /api/admin/usuarios
-app.get('/api/admin/usuarios', async (req, res) => {
+app.get('/api/admin/usuarios', requireRole('administrador'), async (req, res) => {
     try {
         const [usersResult, permissionsMap] = await Promise.all([
             pool.query(
@@ -4666,11 +4707,18 @@ app.get('/api/admin/usuarios', async (req, res) => {
 });
 
 // GET /api/admin/permisos-pantallas?email=xxx
-// Sin email → devuelve el mapa completo de todos los usuarios
+// Sin email → devuelve el mapa completo de todos los usuarios (solo administrador).
+// Con email → cualquier usuario autenticado puede consultar SUS PROPIOS permisos
+// (se usa justo después del login para decidir qué pantallas mostrar); consultar
+// los permisos de otro email sigue requiriendo rol administrador.
 app.get('/api/admin/permisos-pantallas', async (req, res) => {
+    const email = String(req.query.email || '').trim().toLowerCase();
+    const esConsultaPropia = email && email === String(req.auth?.email || '').toLowerCase();
+    if (!esConsultaPropia && req.auth?.rol !== 'administrador') {
+        return res.status(403).json({ error: 'No tiene permisos para esta acción' });
+    }
     try {
         const permissionsMap = await getUserScreenPermissionsMap();
-        const email = String(req.query.email || '').trim().toLowerCase();
 
         if (!email) {
             // Devolver mapa completo (usado por GestionUsuarios para el merge)
@@ -4686,7 +4734,7 @@ app.get('/api/admin/permisos-pantallas', async (req, res) => {
 });
 
 // PUT /api/admin/permisos-pantallas
-app.put('/api/admin/permisos-pantallas', async (req, res) => {
+app.put('/api/admin/permisos-pantallas', requireRole('administrador'), async (req, res) => {
     const { email, permisos = [] } = req.body || {};
     try {
         const emailKey = String(email || '').trim().toLowerCase();
@@ -4701,8 +4749,8 @@ app.put('/api/admin/permisos-pantallas', async (req, res) => {
             tipo_log: 'seguridad', modulo: 'administracion', tabla: 'permisos_pantallas',
             registro_id: '00000000-0000-0000-0000-000000000002', accion: 'UPDATE',
             campo: 'permisos', valor_anterior: null, valor_nuevo: permisosSanitizados.join(','),
-            descripcion: `Actualizó permisos de pantalla para: ${emailKey}`,
-            usuario_id: null, rol_usuario: 'administrador',
+            descripcion: `${req.auth.email} actualizó permisos de pantalla para: ${emailKey}`,
+            usuario_id: req.auth.usuarioId, rol_usuario: req.auth.rol,
             ip_address: getClientIp(req), resultado: 'exitoso'
         });
 
@@ -4718,7 +4766,7 @@ app.put('/api/admin/permisos-pantallas', async (req, res) => {
 });
 
 // PUT /api/admin/usuarios/:id/permisos-pantallas
-app.put('/api/admin/usuarios/:id/permisos-pantallas', async (req, res) => {
+app.put('/api/admin/usuarios/:id/permisos-pantallas', requireRole('administrador'), async (req, res) => {
     const { id } = req.params;
     const { permisos = [] } = req.body || {};
 
@@ -4740,6 +4788,15 @@ app.put('/api/admin/usuarios/:id/permisos-pantallas', async (req, res) => {
         permissionsMap[emailKey] = permisosSanitizados;
         await saveUserScreenPermissionsMap(permissionsMap);
 
+        await registrarLog({
+            tipo_log: 'seguridad', modulo: 'administracion', tabla: 'permisos_pantallas',
+            registro_id: user.id, accion: 'UPDATE',
+            campo: 'permisos', valor_anterior: null, valor_nuevo: permisosSanitizados.join(','),
+            descripcion: `${req.auth.email} actualizó permisos de pantalla para: ${emailKey}`,
+            usuario_id: req.auth.usuarioId, rol_usuario: req.auth.rol,
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
         return res.json({
             ok: true,
             usuario_id: user.id,
@@ -4754,7 +4811,7 @@ app.put('/api/admin/usuarios/:id/permisos-pantallas', async (req, res) => {
 });
 
 // GET /api/admin/logs/stats — contadores totales por tipo_log para las tarjetas de resumen
-app.get('/api/admin/logs/stats', async (req, res) => {
+app.get('/api/admin/logs/stats', requireRole('administrador'), async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT tipo_log, COUNT(*)::int AS total
@@ -4773,7 +4830,7 @@ app.get('/api/admin/logs/stats', async (req, res) => {
 
 // GET /api/admin/logs
 // Query params: tipo_log, modulo, accion, fecha_inicio, fecha_fin, busqueda, limit, offset
-app.get('/api/admin/logs', async (req, res) => {
+app.get('/api/admin/logs', requireRole('administrador'), async (req, res) => {
     try {
         const {
             tipo_log, modulo, accion,
@@ -4850,7 +4907,7 @@ app.get('/api/admin/logs', async (req, res) => {
 });
 
 // GET /api/admin/configuracion
-app.get('/api/admin/configuracion', async (req, res) => {
+app.get('/api/admin/configuracion', requireRole('administrador'), async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM configuracion ORDER BY clave');
         const config = {};
@@ -4865,8 +4922,10 @@ app.get('/api/admin/configuracion', async (req, res) => {
 });
 
 // POST /api/admin/configuracion
-app.post('/api/admin/configuracion', async (req, res) => {
+app.post('/api/admin/configuracion', requireRole('administrador'), async (req, res) => {
     const config = req.body; // { clave: valor, ... }
+    // _usuario_id/_usuario_email ya no se toman del body (el cliente podía
+    // autodeclarar cualquier valor); el actor real viene del token verificado.
     const { _usuario_id, _usuario_email, ...claves } = config;
     try {
         for (const [clave, valor] of Object.entries(claves)) {
@@ -4882,8 +4941,8 @@ app.post('/api/admin/configuracion', async (req, res) => {
                 tipo_log: 'configuracion', modulo: 'administracion', tabla: 'configuracion',
                 registro_id: '00000000-0000-0000-0000-000000000001', accion: 'UPDATE',
                 campo: clave, valor_anterior: valorAnterior, valor_nuevo: valor.toString(),
-                descripcion: `Cambió parámetro de configuración: ${clave}`,
-                usuario_id: _usuario_id || null, rol_usuario: 'administrador',
+                descripcion: `${req.auth.email} cambió parámetro de configuración: ${clave}`,
+                usuario_id: req.auth.usuarioId, rol_usuario: req.auth.rol,
                 ip_address: getClientIp(req), resultado: 'exitoso'
             });
         }
@@ -5226,8 +5285,7 @@ app.get('/api/proponente/convocatoria', proponenteRateLimit, async (req, res) =>
         const vencida = ahora > fechaLimite;
 
         // Registrar primer acceso e incrementar contador (sin bloquear la respuesta)
-        const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
-            .split(',')[0].trim();
+        const ip = getClientIp(req);
         pool.query(
             `UPDATE convocatoria_invitaciones
              SET primer_acceso_en = COALESCE(primer_acceso_en, NOW()),
@@ -5422,6 +5480,13 @@ app.post('/api/proponente/subir-archivo', proponenteRateLimit, (req, res, next) 
             [inv.id, JSON.stringify(archivos)]
         );
 
+        await registrarLog({
+            tipo_log: 'acceso', modulo: 'proponentes', tabla: 'convocatoria_invitaciones',
+            registro_id: inv.id, accion: 'INSERT',
+            descripcion: `Proponente ${inv.proponente_email || 'desconocido'} subió el archivo "${nuevoArchivo.nombre}"`,
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
         return res.status(201).json(nuevoArchivo);
     } catch (err) {
         console.error(err);
@@ -5467,6 +5532,13 @@ app.delete('/api/proponente/eliminar-archivo', proponenteRateLimit, async (req, 
             `UPDATE convocatoria_invitaciones SET respuesta_archivos = $2::jsonb WHERE id = $1::uuid`,
             [inv.id, JSON.stringify(actualizados)]
         );
+
+        await registrarLog({
+            tipo_log: 'acceso', modulo: 'proponentes', tabla: 'convocatoria_invitaciones',
+            registro_id: inv.id, accion: 'DELETE',
+            descripcion: `Proponente ${inv.proponente_email || 'desconocido'} eliminó el archivo "${archivoEliminar?.nombre || archivo_id}"`,
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
 
         return res.json({ ok: true });
     } catch (err) {
@@ -5542,6 +5614,15 @@ app.post('/api/proponente/subir-documento-ra14', proponenteRateLimit, (req, res,
             [inv.id, JSON.stringify(documentosActualizados)]
         );
 
+        // Documento con datos personales/tributarios (cédula, SARLAFT, certificación
+        // bancaria, etc.) — se audita el acceso por trazabilidad (Ley 1581/2012).
+        await registrarLog({
+            tipo_log: 'acceso', modulo: 'proponentes', tabla: 'convocatoria_invitaciones',
+            registro_id: inv.id, accion: 'INSERT', campo: tipo,
+            descripcion: `Proponente ${inv.proponente_email || 'desconocido'} subió el documento "${DOCUMENTOS_PROVEEDOR_LABELS[tipo] || tipo}"`,
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
         return res.status(201).json(nuevoDocumento);
     } catch (err) {
         console.error(err);
@@ -5587,6 +5668,13 @@ app.delete('/api/proponente/eliminar-documento-ra14', proponenteRateLimit, async
             [inv.id, JSON.stringify(actualizados)]
         );
 
+        await registrarLog({
+            tipo_log: 'acceso', modulo: 'proponentes', tabla: 'convocatoria_invitaciones',
+            registro_id: inv.id, accion: 'DELETE', campo: tipo,
+            descripcion: `Proponente ${inv.proponente_email || 'desconocido'} eliminó el documento "${DOCUMENTOS_PROVEEDOR_LABELS[tipo] || tipo}"`,
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
         return res.json({ ok: true });
     } catch (err) {
         console.error(err);
@@ -5622,7 +5710,7 @@ app.get('/api/proveedores/buscar-por-documento', proponenteRateLimit, async (req
     try {
         await ensureConvocatoriasStorage();
         const result = await pool.query(
-            `SELECT proponente_nombre, proponente_email, telefono, cedula_nit,
+            `SELECT id, proponente_nombre, proponente_email, telefono, cedula_nit,
                     tipo_documento, domicilio, pagina_web,
                     representante_legal_nombre, representante_legal_tipo_id, representante_legal_identificacion,
                     representante_legal_direccion, representante_legal_autorizado,
@@ -5640,6 +5728,16 @@ app.get('/api/proveedores/buscar-por-documento', proponenteRateLimit, async (req
         if (result.rows.length === 0) return res.status(404).json({ encontrado: false });
 
         const r = result.rows[0];
+
+        // Consulta pública de datos personales/tributarios por número de documento
+        // — se audita el acceso por trazabilidad (Ley 1581/2012).
+        await registrarLog({
+            tipo_log: 'acceso', modulo: 'proponentes', tabla: 'convocatoria_invitaciones',
+            registro_id: r.id, accion: 'SELECT',
+            descripcion: `Consulta pública de datos de proveedor por documento (${tipo_persona}): ${String(documento).trim()}`,
+            ip_address: getClientIp(req), resultado: 'exitoso'
+        });
+
         return res.json({
             encontrado: true,
             nombre: r.proponente_nombre,
@@ -5829,7 +5927,7 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
 
         // Crear token único para el postulante
         const token = generarToken();
-        const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+        const ip = getClientIp(req);
 
         // Construir nombre y cédula/NIT según el tipo de proponente
         const nombreRegistro = tipoPersona === 'persona'

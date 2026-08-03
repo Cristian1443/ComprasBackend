@@ -4746,9 +4746,16 @@ app.put('/api/admin/permisos-pantallas', requireRole('administrador'), async (re
         permissionsMap[emailKey] = permisosSanitizados;
         await saveUserScreenPermissionsMap(permissionsMap);
 
+        // El "registro" afectado es el usuario destinatario, no quien ejecuta la acción.
+        // Se busca por email porque este endpoint no recibe el id del usuario; si el email
+        // todavía no tiene fila en `usuarios` (nunca ha iniciado sesión), se usa un id
+        // de relleno fijo en vez de dejarlo vacío.
+        const destinatario = await usuarioPorEmail(emailKey);
+        const registroIdDestinatario = destinatario?.id || '00000000-0000-0000-0000-000000000002';
+
         await registrarLog({
             tipo_log: 'seguridad', modulo: 'administracion', tabla: 'permisos_pantallas',
-            registro_id: '00000000-0000-0000-0000-000000000002', accion: 'UPDATE',
+            registro_id: registroIdDestinatario, accion: 'UPDATE',
             campo: 'permisos',
             valor_anterior: permisosAnteriores.join(',') || null,
             valor_nuevo: permisosSanitizados.join(','),

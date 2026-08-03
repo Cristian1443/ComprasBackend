@@ -241,7 +241,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
         const { id, etapa } = req.params;
         const {
             actaNumero, fechaSesion, participantes, discusion, decision,
-            solicitudesMultiples,
+            solicitudesMultiples, actaId,
             firmanteJuridica, iniciadoPor,
         } = req.body || {};
 
@@ -378,7 +378,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                 [
                     id, etapa, tipoDocumentoDe(etapa), titulo,
                     acuerdo.agreementId, pdfPath, iniciadoPor || null,
-                    JSON.stringify({ modo: acuerdo.modo || 'real', enlaces_firma: acuerdo.enlacesFirma || [] }),
+                    JSON.stringify({ modo: acuerdo.modo || 'real', enlaces_firma: acuerdo.enlacesFirma || [], actaId: actaId || null }),
                 ]
             );
             const firma = insertFirma.rows[0];
@@ -1013,6 +1013,21 @@ async function sincronizarFirma(pool, firma, firmasDir) {
             await procesarFirmaProveedorCompletada(pool, firma.id);
         } catch (e) {
             console.warn('[firmas] Error post-procesando evaluación de proveedor:', e.message);
+        }
+    }
+
+    // Etapa "comite": el acta solo se considera cerrada cuando su firma
+    // (enlazada vía metadata.actaId) queda 'firmado'. Sin esto, el acta
+    // queda pendiente indefinidamente y VistasSecretariaComite.tsx bloquea
+    // el inicio de una sesión nueva.
+    if (info.firmado && firma.etapa === 'comite' && firma.metadata?.actaId) {
+        try {
+            await pool.query(
+                `UPDATE actas_comite SET cerrada_en = COALESCE(cerrada_en, NOW()), firma_id = $1 WHERE id = $2::uuid`,
+                [firma.id, firma.metadata.actaId]
+            );
+        } catch (e) {
+            console.warn('[firmas] Error cerrando acta de comité:', e.message);
         }
     }
 

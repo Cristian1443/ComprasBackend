@@ -1907,7 +1907,8 @@ app.get('/api/secretaria/actas/historial', async (_req, res) => {
                 `SELECT id::text, acta_numero, fecha_sesion, participantes, solicitudes_ids, decisiones, creado_en,
                         desarrollo_texto, conclusion_texto, desarrollo_cerrado, conclusion_cerrada,
                         firmante_directora_nombre, firmante_directora_cargo,
-                        firmante_secretaria_nombre, firmante_secretaria_cargo
+                        firmante_secretaria_nombre, firmante_secretaria_cargo,
+                        cerrada_en, firma_id
                  FROM actas_comite ORDER BY fecha_sesion DESC`
             );
             actasFormales = r.rows.map(a => ({
@@ -1927,6 +1928,8 @@ app.get('/api/secretaria/actas/historial', async (_req, res) => {
                 firmanteDirectoraCargo: a.firmante_directora_cargo || '',
                 firmanteSecretariaNombre: a.firmante_secretaria_nombre || '',
                 firmanteSecretariaCargo: a.firmante_secretaria_cargo || '',
+                cerradaEn: a.cerrada_en || null,
+                firmaId: a.firma_id || null,
             }));
         } catch (_e) { /* tabla aún no creada */ }
 

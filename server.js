@@ -572,7 +572,7 @@ app.get('/api/solicitudes/:id', async (req, res) => {
         }
 
         // Parsear campos TEXT que se guardan como JSON stringificado
-        const jsonTextFields = ['entregables_detalle', 'obligaciones_especificas', 'anexos_solicitante'];
+        const jsonTextFields = ['entregables_detalle', 'obligaciones_especificas', 'anexos_solicitante', 'criterios_habilitantes_planeacion'];
         for (const field of jsonTextFields) {
             if (solicitud[field] && typeof solicitud[field] === 'string') {
                 try { solicitud[field] = JSON.parse(solicitud[field]); } catch { solicitud[field] = []; }
@@ -802,8 +802,9 @@ app.post('/api/solicitudes', async (req, res) => {
         obligaciones_especificas, entregables_detalle,
         fecha_estimada_solicitud, fecha_estimada_recepcion,
         porcentaje_anticipo,
+        experiencia_acreditada_exigida, criterios_habilitantes_planeacion,
         estado
-      ) VALUES ($1,$2,$3,$3,$4,$33,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,nullif($23,'')::date,$24,$25,$26,$27,$28,$29,$30,$31,$32,$34,$35,$40,$41,$36,$37,$38,$39,$42,$43,$44,nullif($45,'')::date,nullif($46,'')::date,$47,'borrador')
+      ) VALUES ($1,$2,$3,$3,$4,$33,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,nullif($23,'')::date,$24,$25,$26,$27,$28,$29,$30,$31,$32,$34,$35,$40,$41,$36,$37,$38,$39,$42,$43,$44,nullif($45,'')::date,nullif($46,'')::date,$47,$48,$49,'borrador')
       RETURNING id, codigo, estado, creado_en`,
             [
                 solicitante_id, gerencia_id, justificacion, descripcion_necesidad_detalle, objeto,
@@ -826,7 +827,9 @@ app.post('/api/solicitudes', async (req, res) => {
                 JSON.stringify(req.body.entregables_detalle || []),
                 req.body.fecha_estimada_solicitud || null,
                 req.body.fecha_estimada_recepcion || null,
-                porcentaje_anticipo || null
+                porcentaje_anticipo || null,
+                req.body.experiencia_acreditada_exigida || null,
+                JSON.stringify(req.body.criterios_habilitantes_planeacion || [])
             ]
         );
 
@@ -994,6 +997,8 @@ app.put('/api/solicitudes/:id', async (req, res) => {
                 fecha_estimada_solicitud = nullif($45,'')::date,
                 fecha_estimada_recepcion = nullif($46,'')::date,
                 porcentaje_anticipo = $47,
+                experiencia_acreditada_exigida = $48,
+                criterios_habilitantes_planeacion = $49,
                 actualizado_en = NOW(),
                 actualizado_por = COALESCE($31, actualizado_por)
             WHERE id = $30
@@ -1018,7 +1023,9 @@ app.put('/api/solicitudes/:id', async (req, res) => {
                 JSON.stringify(req.body.entregables_detalle || []),
                 req.body.fecha_estimada_solicitud || null,
                 req.body.fecha_estimada_recepcion || null,
-                porcentaje_anticipo || null
+                porcentaje_anticipo || null,
+                req.body.experiencia_acreditada_exigida || null,
+                JSON.stringify(req.body.criterios_habilitantes_planeacion || [])
             ]
         );
 
@@ -6758,6 +6765,8 @@ app.put('/api/convocatorias/:id/link-publico', async (req, res) => {
         await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS justificacion_anticipo TEXT`);
         await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS obligaciones_especificas TEXT`);
         await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS entregables_detalle TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS experiencia_acreditada_exigida TEXT`);
+        await pool.query(`ALTER TABLE solicitudes ADD COLUMN IF NOT EXISTS criterios_habilitantes_planeacion TEXT`);
         console.log('✓ Columnas faltantes verificadas en solicitudes');
     } catch (e) {
         console.error('Advertencia al verificar columnas faltantes en solicitudes:', e.message);

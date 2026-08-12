@@ -14,6 +14,7 @@ uploads/facturas/*
 uploads/firmas/*
 uploads/actas/*
 uploads/reconocimientos/*
+uploads/proveedores/*
 !uploads/**/.gitkeep
 
 # Logs

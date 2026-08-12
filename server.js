@@ -116,14 +116,42 @@ const uploadProveedores = multer({
         else cb(new Error(`Tipo de archivo no permitido: .${ext}`));
     }
 });
-const DOCUMENTOS_PROVEEDOR_CAMPOS = ['rut', 'camara_comercio', 'cedula_rl', 'sarlaft', 'certificacion_bancaria'];
+// Documentos que debe cargar el proponente, sin importar la modalidad de contratación
+// (solo las filas resaltadas en amarillo del checklist oficial "Check list (V.F)" — el resto
+// de filas del checklist, como Certificación Bancaria o Información Comercial, las genera
+// internamente Jurídica/Cumplimiento y no se le piden al proponente en este formulario)
+const DOCUMENTOS_PROVEEDOR_CAMPOS = ['rut', 'cedula_rl', 'camara_comercio', 'redam', 'antecedentes_fiscales', 'antecedentes_disciplinarios', 'antecedentes_judiciales'];
+// Documentos adicionales que solo aplican cuando la convocatoria es de "Prestación de servicios profesionales"
+const DOCUMENTOS_PROVEEDOR_CAMPOS_SERVICIOS_PROFESIONALES = ['hoja_vida', 'titulo_profesional', 'certificaciones_laborales'];
 const DOCUMENTOS_PROVEEDOR_LABELS = {
     rut: 'RUT',
-    camara_comercio: 'Cámara de comercio',
-    cedula_rl: 'Fotocopia cédula de ciudadanía',
-    sarlaft: 'SARLAFT',
-    certificacion_bancaria: 'Certificación bancaria',
+    cedula_rl: 'Cédula (persona natural / representante legal)',
+    camara_comercio: 'Certificado de existencia y representación legal (Cámara de comercio)',
+    redam: 'REDAM (Registro de Deudores Alimentarios Morosos)',
+    antecedentes_fiscales: 'Antecedentes fiscales',
+    antecedentes_disciplinarios: 'Antecedentes disciplinarios',
+    antecedentes_judiciales: 'Antecedentes judiciales',
+    hoja_vida: 'Hoja de vida',
+    titulo_profesional: 'Título profesional',
+    certificaciones_laborales: 'Certificaciones laborales',
 };
+
+// Documentos del checklist que solo aplican a proponentes tipo "empresa" (persona jurídica).
+// El "Certificado de existencia y Rep. Legal" del PDF trae explícitamente "(personas jurídicas)".
+const DOCUMENTOS_PROVEEDOR_CAMPOS_SOLO_EMPRESA = ['camara_comercio'];
+
+// Calcula qué documentos debe cargar un proponente según su tipo de persona y el tipo de
+// objeto contractual de la convocatoria — refleja el checklist oficial "Check list (V.F)".
+function camposDocumentosRequeridos(tipoPersona, tipoObjeto) {
+    let campos = DOCUMENTOS_PROVEEDOR_CAMPOS;
+    if (tipoPersona === 'persona') {
+        campos = campos.filter(c => !DOCUMENTOS_PROVEEDOR_CAMPOS_SOLO_EMPRESA.includes(c));
+    }
+    if (tipoObjeto === 'servicios_profesionales') {
+        campos = [...campos, ...DOCUMENTOS_PROVEEDOR_CAMPOS_SERVICIOS_PROFESIONALES];
+    }
+    return campos;
+}
 
 // ─── Conexión PostgreSQL ───────────────────────────────────────
 // (se crea antes que `app` porque el middleware de autenticación,
@@ -1663,6 +1691,8 @@ app.put('/api/supervisor/solicitudes/:id/calificacion', async (req, res) => {
                 experiencia_adicional: Number(c?.experiencia_adicional || 0),
                 experiencia_trabajo: Number(c?.experiencia_trabajo || 0),
                 otros_criterios_puntos: Number(c?.otros_criterios_puntos || 0),
+                puntajes: (c?.puntajes && typeof c.puntajes === 'object') ? c.puntajes : {},
+                habilitante_detalle: c?.habilitante_detalle || null,
                 total: Number(c?.total || 0)
             })) : [],
             config_puntajes: config_puntajes || null,
@@ -2537,9 +2567,9 @@ app.get('/api/gerente/metrics', async (req, res) => {
 
         // Actividad reciente
         const activityQuery = `
-            SELECT 
-                s.id, s.objeto as project, u.nombre as user, s.estado as status,
-                CASE 
+            SELECT
+                s.id, COALESCE(NULLIF(s.titulo_contrato, ''), s.objeto) as project, u.nombre as user, s.estado as status,
+                CASE
                     WHEN s.actualizado_en > NOW() - INTERVAL '1 hour' THEN 'Hace unos minutos'
                     WHEN s.actualizado_en > NOW() - INTERVAL '24 hours' THEN 'Hoy'
                     ELSE TO_CHAR(s.actualizado_en, 'DD Mon')
@@ -2650,9 +2680,9 @@ app.get('/api/financiera/metrics', async (req, res) => {
 
         // Actividad reciente (movimientos en financiera)
         const activityQuery = `
-            SELECT 
-                s.id, s.objeto as project, u.nombre as user, s.estado as status,
-                CASE 
+            SELECT
+                s.id, COALESCE(NULLIF(s.titulo_contrato, ''), s.objeto) as project, u.nombre as user, s.estado as status,
+                CASE
                     WHEN s.actualizado_en > NOW() - INTERVAL '1 hour' THEN 'Hace unos minutos'
                     WHEN s.actualizado_en > NOW() - INTERVAL '24 hours' THEN 'Hoy'
                     ELSE TO_CHAR(s.actualizado_en, 'DD Mon')
@@ -3004,12 +3034,17 @@ function requiereFlujoSecuencialJuridica(modalidad) {
     return m === 'directa' || m === 'tdr' || m === 'invitacion';
 }
 
+// Se basa en si ya se envió el enlace formal a AL MENOS UN proponente (ci.link_enviado_en),
+// no en c.fase_invitacion_enviada — esa bandera solo se marca cuando TODOS los invitados ya
+// completaron su registro RA1-4, y el paso "Invitación" del flujo no debe quedar bloqueado
+// mientras Jurídica espera a algún rezagado que aún no se registra.
 async function invitacionesEnviadasPara(solicitudId) {
     const r = await pool.query(
         `SELECT EXISTS (
-            SELECT 1 FROM convocatorias c
+            SELECT 1 FROM convocatoria_invitaciones ci
+             JOIN convocatorias c ON ci.convocatoria_id = c.id
              WHERE c.solicitud_id = $1::uuid
-               AND c.fase_invitacion_enviada = TRUE
+               AND ci.link_enviado_en IS NOT NULL
          ) AS enviadas`,
         [solicitudId]
     );
@@ -3116,13 +3151,29 @@ async function construirDetalleCalificacion(id) {
         await ensureJuridicaDetailStorage();
 
         const solRes = await pool.query(
-            `SELECT id, codigo, objeto, modalidad, solicitante_nombre, gerencia_nombre, estado
+            `SELECT id, codigo, objeto, titulo_contrato, modalidad, solicitante_nombre, gerencia_nombre, estado,
+                    descripcion_necesidad_detalle, presupuesto_aprobado, moneda
              FROM v_solicitudes_resumen
              WHERE id = $1::uuid`,
             [id]
         );
         if (solRes.rows.length === 0) return { error: 'Solicitud no encontrada', status: 404 };
         const solicitud = solRes.rows[0];
+
+        // Requisitos generales definidos por el Solicitante en la Planeación Contractual
+        // (no están en v_solicitudes_resumen) — se muestran como referencia en la evaluación.
+        const planRes = await pool.query(
+            `SELECT experiencia_acreditada_exigida, criterios_habilitantes_planeacion
+             FROM solicitudes WHERE id = $1::uuid`,
+            [id]
+        );
+        solicitud.experiencia_acreditada_exigida = planRes.rows[0]?.experiencia_acreditada_exigida || null;
+        try {
+            const raw = planRes.rows[0]?.criterios_habilitantes_planeacion;
+            solicitud.criterios_habilitantes_planeacion = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : [];
+        } catch {
+            solicitud.criterios_habilitantes_planeacion = [];
+        }
 
         // 1. Obtener todas las invitaciones de esta solicitud.
         //    Cada registro de convocatoria_invitaciones es único por ci.id.
@@ -3140,7 +3191,11 @@ async function construirDetalleCalificacion(id) {
                 ci.respondida,
                 ci.respuesta_archivos,
                 ci.respuesta_texto as respuesta_proponente,
-                ci.creado_en
+                ci.creado_en,
+                ci.documentos_proveedor,
+                ci.tipo_persona,
+                ci.tipo_documento,
+                c.tipo_objeto
              FROM convocatoria_invitaciones ci
              JOIN convocatorias c ON ci.convocatoria_id = c.id
              WHERE c.solicitud_id = $1::uuid
@@ -3202,7 +3257,12 @@ async function construirDetalleCalificacion(id) {
                 valor_con_impuestos: match ? match.valor_con_impuestos : null,
                 valor_agregado: match ? match.valor_agregado : null,
                 observaciones: match ? match.observaciones : null,
-                moneda: match ? match.moneda : 'COP'
+                moneda: match ? match.moneda : 'COP',
+                documentos_proveedor: Array.isArray(ci.documentos_proveedor) ? ci.documentos_proveedor : [],
+                tipo_persona: ci.tipo_persona || 'empresa',
+                tipo_objeto: ci.tipo_objeto || 'bienes_servicios',
+                // Señal de que completó el registro RA1-4 en el link público (Fase 1).
+                completo_fase1: Boolean(ci.tipo_documento)
             };
         });
 
@@ -3268,7 +3328,6 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
     const { id } = req.params;
     const {
         calificaciones = [],
-        config_puntajes = null,
         evaluacion_consolidada = '',
         proponente_recomendado_numero = null,
         ganador_email = null,
@@ -3279,15 +3338,13 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
         proponentes_editados = [],
         email = null,
         firmas = {},
-        finalizada = false,
-        habilitantes_revisados = []
+        finalizada = false
     } = req.body || {};
 
     const numeroRecomendadoRaw = proponente_recomendado_numero != null ? Number(proponente_recomendado_numero) : null;
     const numeroRecomendado = Number.isFinite(numeroRecomendadoRaw) && numeroRecomendadoRaw > 0
         ? Math.trunc(numeroRecomendadoRaw)
         : null;
-    const habilitantesRevisadosNums = Array.isArray(habilitantes_revisados) ? habilitantes_revisados.map(Number) : [];
 
     const client = await pool.connect();
     try {
@@ -3321,18 +3378,6 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
         }
 
         if (finalizada === true) {
-            const detalle = await construirDetalleCalificacion(id);
-            const proponentesQueRespondieron = Array.isArray(detalle?.data?.proponentes)
-                ? detalle.data.proponentes.filter(p => p.respondida)
-                : [];
-            const faltantes = proponentesQueRespondieron.filter(p => !habilitantesRevisadosNums.includes(Number(p.numero)));
-            if (faltantes.length > 0) {
-                await client.query('ROLLBACK');
-                return res.status(409).json({
-                    error: 'Debe revisar el detalle de requisitos habilitantes de todos los proponentes antes de finalizar.'
-                });
-            }
-
             const supervisorRecomendado = prevEv.supervisor?.proponente_recomendado_numero != null
                 ? Number(prevEv.supervisor.proponente_recomendado_numero)
                 : null;
@@ -3402,18 +3447,12 @@ app.put('/api/juridica/solicitudes/:id/calificacion', async (req, res) => {
             supervisor: prevEv.supervisor || null,
             finalizada: finalizada === true ? true : (prevEv.finalizada || false),
             finalizada_en: finalizada === true ? new Date().toISOString() : (prevEv.finalizada_en || null),
-            habilitantes_revisados: habilitantesRevisadosNums,
+            // Jurídica no puntúa — solo el Supervisor califica. Aquí únicamente se guarda el
+            // checklist de cumplimiento (legal/experiencia/académico) por proponente.
             calificaciones: Array.isArray(calificaciones) ? calificaciones.map((c) => ({
                 numero: Number.isFinite(Number(c?.numero)) ? Number(c.numero) : null,
-                propuesta_economica: Number(c?.propuesta_economica ?? c?.requisitos_habilitantes ?? 0),
-                experiencia_adicional: Number(c?.experiencia_adicional ?? c?.prueba_tecnica ?? 0),
-                experiencia_trabajo: Number(c?.experiencia_trabajo ?? 0),
-                otros_criterios_puntos: Number(c?.otros_criterios_puntos ?? c?.experiencia ?? 0),
                 checklist: c?.checklist || {},
-                habilitante_detalle: c?.habilitante_detalle || null,
-                total: Number(c?.total || 0)
             })) : [],
-            config_puntajes: config_puntajes || null,
             proponentes_editados: Array.isArray(proponentes_editados) ? proponentes_editados : [],
             evaluacion_consolidada: String(evaluacion_consolidada || ''),
             proponente_recomendado_numero: numeroRecomendado,
@@ -3973,7 +4012,7 @@ app.get('/api/juridica/metrics', async (req, res) => {
 
         // Actividad reciente para jurídica
         const activityQuery = `
-            SELECT s.id, s.codigo, s.objeto, s.estado, s.actualizado_en as fecha,
+            SELECT s.id, s.codigo, s.objeto, s.titulo_contrato, s.estado, s.actualizado_en as fecha,
                    u.nombre as solicitante_nombre, s.modalidad,
                    s.valor_en_cop, s.valor_estimado, s.moneda,
                    s.valor_moneda_cop_texto, s.valor_moneda_usd_texto
@@ -5038,6 +5077,9 @@ async function ensureConvocatoriasStorage() {
     await pool.query(`ALTER TABLE convocatorias ADD COLUMN IF NOT EXISTS fase1_notificacion_enviada_en TIMESTAMPTZ`);
     // Tipo de proponente esperado en registro público: 'empresa' (default) o 'persona'
     await pool.query(`ALTER TABLE convocatorias ADD COLUMN IF NOT EXISTS tipo_proponente TEXT NOT NULL DEFAULT 'empresa'`);
+    // Tipo de objeto contractual: 'bienes_servicios' (default) o 'servicios_profesionales' —
+    // determina qué documentos adicionales debe cargar el proponente en el RA1-4 (checklist oficial)
+    await pool.query(`ALTER TABLE convocatorias ADD COLUMN IF NOT EXISTS tipo_objeto TEXT NOT NULL DEFAULT 'bienes_servicios'`);
     // Documento adjunto para la Fase 2 (PDF, DOCX, etc.) — URL relativa al servidor
     await pool.query(`ALTER TABLE convocatorias ADD COLUMN IF NOT EXISTS documento_adjunto_url TEXT`);
     await pool.query(`ALTER TABLE convocatorias ADD COLUMN IF NOT EXISTS documento_adjunto_nombre TEXT`);
@@ -5082,7 +5124,7 @@ async function ensureConvocatoriasStorage() {
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS banco_email_contacto TEXT`);
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS tipo_cuenta TEXT`);
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS numero_cuenta TEXT`);
-    // Documentos adjuntos (RUT, Cámara de Comercio, Cédula RL, SARLAFT, Certificación bancaria)
+    // Documentos adjuntos del proveedor (ver DOCUMENTOS_PROVEEDOR_CAMPOS)
     await pool.query(`ALTER TABLE convocatoria_invitaciones ADD COLUMN IF NOT EXISTS documentos_proveedor JSONB NOT NULL DEFAULT '[]'::jsonb`);
 }
 
@@ -5115,6 +5157,7 @@ app.post('/api/convocatorias', async (req, res) => {
         proponentes,
         creada_por,
         tipo_proponente,            // 'empresa' (default) o 'persona'
+        tipo_objeto,                // 'bienes_servicios' (default) o 'servicios_profesionales'
         documento_adjunto_url,      // URL del documento adjunto para Fase 2
         documento_adjunto_nombre
     } = req.body;
@@ -5135,13 +5178,13 @@ app.post('/api/convocatorias', async (req, res) => {
         const convRes = await client.query(
             `INSERT INTO convocatorias
                 (solicitud_id, asunto, descripcion_publica, descripcion_requisitos, fecha_inicio, fecha_limite,
-                 fecha_limite_registro, creada_por, link_publico_activo, tipo_proponente, documento_adjunto_url, documento_adjunto_nombre)
-             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10, $11)
+                 fecha_limite_registro, creada_por, link_publico_activo, tipo_proponente, tipo_objeto, documento_adjunto_url, documento_adjunto_nombre)
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $10, $11, $12)
              RETURNING *`,
             [
                 solicitud_id, asunto, descripcion_publica, descripcion_requisitos || '',
                 fecha_inicio || new Date().toISOString(), fecha_limite || null, fecha_limite_registro,
-                creada_por || null, tipo_proponente || 'empresa',
+                creada_por || null, tipo_proponente || 'empresa', tipo_objeto || 'bienes_servicios',
                 documento_adjunto_url || null, documento_adjunto_nombre || null
             ]
         );
@@ -5289,7 +5332,7 @@ app.get('/api/proponente/convocatoria', proponenteRateLimit, async (req, res) =>
 
         const invRes = await pool.query(
             `SELECT ci.*, c.asunto, c.descripcion_requisitos, c.fecha_inicio, c.fecha_limite, c.estado as conv_estado,
-                    c.documento_adjunto_url, c.documento_adjunto_nombre,
+                    c.documento_adjunto_url, c.documento_adjunto_nombre, c.tipo_objeto,
                     s.codigo as solicitud_codigo, s.objeto as solicitud_objeto
              FROM convocatoria_invitaciones ci
              JOIN convocatorias c ON ci.convocatoria_id = c.id
@@ -5328,6 +5371,8 @@ app.get('/api/proponente/convocatoria', proponenteRateLimit, async (req, res) =>
             fecha_limite: inv.fecha_limite,
             solicitud_codigo: inv.solicitud_codigo,
             solicitud_objeto: inv.solicitud_objeto,
+            tipo_objeto: inv.tipo_objeto || 'bienes_servicios',
+            tipo_persona: inv.tipo_persona || 'empresa',
             documento_adjunto_url: inv.documento_adjunto_url || null,
             documento_adjunto_nombre: inv.documento_adjunto_nombre || null,
             ya_respondida: inv.respondida,
@@ -5368,7 +5413,7 @@ app.post('/api/proponente/responder', proponenteRateLimit, async (req, res) => {
 
         // Verificar invitación
         const invRes = await pool.query(
-            `SELECT ci.*, c.fecha_limite, c.estado as conv_estado
+            `SELECT ci.*, c.fecha_limite, c.estado as conv_estado, c.tipo_objeto
              FROM convocatoria_invitaciones ci
              JOIN convocatorias c ON ci.convocatoria_id = c.id
              WHERE ci.token = $1`,
@@ -5396,9 +5441,12 @@ app.post('/api/proponente/responder', proponenteRateLimit, async (req, res) => {
             });
         }
 
-        // Verificar que los 5 documentos del formulario RA1-4 ya fueron subidos
+        // Verificar que los documentos del formulario RA1-4 ya fueron subidos.
+        // Camara de comercio solo aplica a personas jurídicas; los 3 documentos de
+        // "servicios profesionales" solo se exigen para esa modalidad.
         const documentosProveedor = Array.isArray(inv.documentos_proveedor) ? inv.documentos_proveedor : [];
-        for (const campo of DOCUMENTOS_PROVEEDOR_CAMPOS) {
+        const camposRequeridos = camposDocumentosRequeridos(inv.tipo_persona, inv.tipo_objeto);
+        for (const campo of camposRequeridos) {
             if (!documentosProveedor.some(d => d.tipo === campo)) {
                 return res.status(400).json({ error: `Debes adjuntar el documento: ${DOCUMENTOS_PROVEEDOR_LABELS[campo]}.` });
             }
@@ -5584,7 +5632,7 @@ app.post('/api/proponente/subir-documento-ra14', proponenteRateLimit, (req, res,
 }, async (req, res) => {
     const { token, tipo } = req.body;
     if (!token) { if (req.file) fs.unlinkSync(req.file.path); return res.status(400).json({ error: 'Token requerido' }); }
-    if (!DOCUMENTOS_PROVEEDOR_CAMPOS.includes(tipo)) { if (req.file) fs.unlinkSync(req.file.path); return res.status(400).json({ error: 'Tipo de documento no válido' }); }
+    if (![...DOCUMENTOS_PROVEEDOR_CAMPOS, ...DOCUMENTOS_PROVEEDOR_CAMPOS_SERVICIOS_PROFESIONALES].includes(tipo)) { if (req.file) fs.unlinkSync(req.file.path); return res.status(400).json({ error: 'Tipo de documento no válido' }); }
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo' });
 
     try {
@@ -5637,7 +5685,7 @@ app.post('/api/proponente/subir-documento-ra14', proponenteRateLimit, (req, res,
             [inv.id, JSON.stringify(documentosActualizados)]
         );
 
-        // Documento con datos personales/tributarios (cédula, SARLAFT, certificación
+        // Documento con datos personales/tributarios (cédula, certificación
         // bancaria, etc.) — se audita el acceso por trazabilidad (Ley 1581/2012).
         await registrarLog({
             tipo_log: 'acceso', modulo: 'proponentes', tabla: 'convocatoria_invitaciones',
@@ -5885,7 +5933,7 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
     // ── Validación de campos del formulario RA1-4 (identificación y datos tributarios — obligatorios en Fase 1) ──
     const camposTexto = {
         'Tipo de documento': tipo_documento, 'Número de documento': numeroDocumento,
-        'Domicilio': domicilio, 'Teléfono': telefono, 'Página web': pagina_web,
+        'Domicilio': domicilio, 'Teléfono': telefono,
         'CIIU': ciiu, 'Tarifa': tarifa, 'Régimen': regimen,
         'Actividad económica': actividad_economica, 'Municipio donde está inscrito': municipio_inscripcion,
     };
@@ -5938,18 +5986,22 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
             return res.status(403).json({ error: 'El plazo para registrarse ha vencido.', fecha_limite: fechaLimiteReg, razon_cierre: 'plazo_vencido' });
         }
 
-        // Evitar duplicados: mismo email en la misma convocatoria
-        const duplicado = await client.query(
-            `SELECT id FROM convocatoria_invitaciones WHERE convocatoria_id = $1::uuid AND proponente_email = $2`,
+        // Ver si ya existe una fila para este email en esta convocatoria: puede ser un
+        // "proponente conocido" que Jurídica agregó directamente al crear la convocatoria
+        // (sin RA1-4 todavía, tipo_documento IS NULL) — en ese caso se completa esa misma
+        // fila en vez de rechazar, para que quede registrado vía el link público y pueda
+        // recibir la invitación de Fase 2. Si ya tiene RA1-4 diligenciado, sí es duplicado.
+        const existenteRes = await client.query(
+            `SELECT id, token, tipo_documento FROM convocatoria_invitaciones WHERE convocatoria_id = $1::uuid AND proponente_email = $2`,
             [id, email.toLowerCase().trim()]
         );
-        if (duplicado.rows.length > 0) {
+        const filaExistente = existenteRes.rows[0] || null;
+        if (filaExistente && filaExistente.tipo_documento) {
             await client.query('ROLLBACK');
             return fallar(409, 'Ya existe una postulación registrada con ese correo para esta convocatoria.');
         }
 
-        // Crear token único para el postulante
-        const token = generarToken();
+        const token = filaExistente?.token || generarToken();
         const ip = getClientIp(req);
 
         // Construir nombre y cédula/NIT según el tipo de proponente
@@ -5958,42 +6010,66 @@ app.post('/api/convocatoria-publica/:id/postular', proponenteRateLimit, async (r
             : (nombre_contacto ? `${nombre_empresa} — ${nombre_contacto}` : nombre_empresa);
         const cedulaNit = numeroDocumento || null;
 
-        const invRes = await client.query(
-            `INSERT INTO convocatoria_invitaciones
-                (convocatoria_id, proponente_email, proponente_nombre, token,
-                 es_postulacion_publica, telefono, cedula_nit, tipo_persona,
-                 primer_acceso_en, ip_acceso, total_accesos,
-                 respondida, respuesta_archivos,
-                 acepta_tratamiento_datos, acepta_tratamiento_datos_en,
-                 tipo_documento, domicilio, pagina_web,
-                 representante_legal_nombre, representante_legal_tipo_id, representante_legal_identificacion,
-                 representante_legal_direccion, representante_legal_autorizado,
-                 ciiu, tarifa, regimen, actividad_economica, municipio_inscripcion,
-                 es_gran_contribuyente, gran_contribuyente_resolucion, gran_contribuyente_fecha,
-                 es_auto_retenedor, auto_retenedor_resolucion, auto_retenedor_fecha,
-                 es_entidad_estado, exento_impuesto_renta)
-             VALUES ($1::uuid, $2, $3, $4, TRUE, $5, $6, $7, NOW(), $8, 1, FALSE, '[]'::jsonb, TRUE, NOW(),
-                 $9, $10, $11,
-                 $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21,
-                 $22, $23, $24,
-                 $25, $26, $27,
-                 $28, $29)
-             RETURNING id, token`,
-            [
-                id, email.toLowerCase().trim(), nombreRegistro, token, telefono || null, cedulaNit, tipoPersona, ip,
-                tipo_documento.trim(), domicilio.trim(), pagina_web.trim(),
-                tipoPersona === 'empresa' ? representante_legal_nombre.trim() : null,
-                tipoPersona === 'empresa' ? representante_legal_tipo_id.trim() : null,
-                tipoPersona === 'empresa' ? representante_legal_identificacion.trim() : null,
-                tipoPersona === 'empresa' ? representante_legal_direccion.trim() : null,
-                tipoPersona === 'empresa' ? (representante_legal_autorizado || '').trim() || null : null,
-                ciiu.trim(), tarifa.trim(), regimen.trim(), actividad_economica.trim(), municipio_inscripcion.trim(),
-                esBool(es_gran_contribuyente), esBool(es_gran_contribuyente) ? gran_contribuyente_resolucion.trim() : null, esBool(es_gran_contribuyente) ? gran_contribuyente_fecha : null,
-                esBool(es_auto_retenedor), esBool(es_auto_retenedor) ? auto_retenedor_resolucion.trim() : null, esBool(es_auto_retenedor) ? auto_retenedor_fecha : null,
-                esBool(es_entidad_estado), esBool(exento_impuesto_renta),
-            ]
-        );
+        const datosRA14 = [
+            telefono || null, cedulaNit, tipoPersona, ip,
+            tipo_documento.trim(), domicilio.trim(), (pagina_web || '').trim() || null,
+            tipoPersona === 'empresa' ? representante_legal_nombre.trim() : null,
+            tipoPersona === 'empresa' ? representante_legal_tipo_id.trim() : null,
+            tipoPersona === 'empresa' ? representante_legal_identificacion.trim() : null,
+            tipoPersona === 'empresa' ? representante_legal_direccion.trim() : null,
+            tipoPersona === 'empresa' ? (representante_legal_autorizado || '').trim() || null : null,
+            ciiu.trim(), tarifa.trim(), regimen.trim(), actividad_economica.trim(), municipio_inscripcion.trim(),
+            esBool(es_gran_contribuyente), esBool(es_gran_contribuyente) ? gran_contribuyente_resolucion.trim() : null, esBool(es_gran_contribuyente) ? gran_contribuyente_fecha : null,
+            esBool(es_auto_retenedor), esBool(es_auto_retenedor) ? auto_retenedor_resolucion.trim() : null, esBool(es_auto_retenedor) ? auto_retenedor_fecha : null,
+            esBool(es_entidad_estado), esBool(exento_impuesto_renta),
+        ];
+
+        const invRes = filaExistente
+            ? await client.query(
+                // No se sobrescribe proponente_nombre: se conserva el nombre que Jurídica
+                // escribió al agregar este proponente — solo se completan los datos del RA1-4.
+                `UPDATE convocatoria_invitaciones SET
+                    es_postulacion_publica = TRUE,
+                    telefono = $2, cedula_nit = $3, tipo_persona = $4,
+                    primer_acceso_en = COALESCE(primer_acceso_en, NOW()),
+                    ip_acceso = COALESCE(ip_acceso, $5),
+                    total_accesos = COALESCE(total_accesos, 0) + 1,
+                    acepta_tratamiento_datos = TRUE, acepta_tratamiento_datos_en = NOW(),
+                    tipo_documento = $6, domicilio = $7, pagina_web = $8,
+                    representante_legal_nombre = $9, representante_legal_tipo_id = $10, representante_legal_identificacion = $11,
+                    representante_legal_direccion = $12, representante_legal_autorizado = $13,
+                    ciiu = $14, tarifa = $15, regimen = $16, actividad_economica = $17, municipio_inscripcion = $18,
+                    es_gran_contribuyente = $19, gran_contribuyente_resolucion = $20, gran_contribuyente_fecha = $21,
+                    es_auto_retenedor = $22, auto_retenedor_resolucion = $23, auto_retenedor_fecha = $24,
+                    es_entidad_estado = $25, exento_impuesto_renta = $26
+                 WHERE id = $1::uuid
+                 RETURNING id, token`,
+                [filaExistente.id, ...datosRA14]
+              )
+            : await client.query(
+                `INSERT INTO convocatoria_invitaciones
+                    (convocatoria_id, proponente_email, proponente_nombre, token,
+                     es_postulacion_publica, telefono, cedula_nit, tipo_persona,
+                     primer_acceso_en, ip_acceso, total_accesos,
+                     respondida, respuesta_archivos,
+                     acepta_tratamiento_datos, acepta_tratamiento_datos_en,
+                     tipo_documento, domicilio, pagina_web,
+                     representante_legal_nombre, representante_legal_tipo_id, representante_legal_identificacion,
+                     representante_legal_direccion, representante_legal_autorizado,
+                     ciiu, tarifa, regimen, actividad_economica, municipio_inscripcion,
+                     es_gran_contribuyente, gran_contribuyente_resolucion, gran_contribuyente_fecha,
+                     es_auto_retenedor, auto_retenedor_resolucion, auto_retenedor_fecha,
+                     es_entidad_estado, exento_impuesto_renta)
+                 VALUES ($1::uuid, $2, $3, $4, TRUE, $5, $6, $7, NOW(), $8, 1, FALSE, '[]'::jsonb, TRUE, NOW(),
+                     $9, $10, $11,
+                     $12, $13, $14, $15, $16,
+                     $17, $18, $19, $20, $21,
+                     $22, $23, $24,
+                     $25, $26, $27,
+                     $28, $29)
+                 RETURNING id, token`,
+                [id, email.toLowerCase().trim(), nombreRegistro, token, ...datosRA14]
+              );
 
         await client.query('COMMIT');
 
@@ -6295,7 +6371,7 @@ app.delete('/api/convocatorias/:id/invitaciones/:invId', async (req, res) => {
 //   - Los proponentes originales de la solicitud que aún no tienen invitación
 app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => {
     const { id } = req.params;
-    const { fecha_limite: fechaLimitePropuesta, usuario_email } = req.body; // Fase 2: plazo para entregar propuesta
+    const { fecha_limite: fechaLimitePropuesta, usuario_email, tipo_objeto } = req.body; // Fase 2: plazo para entregar propuesta
     const client = await pool.connect();
     try {
         await ensureConvocatoriasStorage();
@@ -6332,6 +6408,16 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
                 [id, fechaLimitePropuesta]
             );
             conv = { ...conv, fecha_limite: fechaLimitePropuesta };
+        }
+
+        // Tipo de objeto contractual — define los documentos RA1-4 exigidos al proponente
+        // (bienes y servicios / servicios profesionales). Se puede fijar hasta el envío de Fase 2.
+        if (tipo_objeto === 'bienes_servicios' || tipo_objeto === 'servicios_profesionales') {
+            await client.query(
+                `UPDATE convocatorias SET tipo_objeto = $2 WHERE id = $1::uuid`,
+                [id, tipo_objeto]
+            );
+            conv = { ...conv, tipo_objeto };
         }
 
         // 2. Proponentes ya registrados en esta convocatoria (públicos o directos)
@@ -6375,12 +6461,21 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
 
         await client.query('COMMIT');
 
-        // 4. Obtener TODAS las invitaciones de esta convocatoria (registrados + nuevos)
+        // 4. Obtener las invitaciones de esta convocatoria que YA completaron su registro
+        // RA1-4 en el link público (tipo_documento IS NOT NULL) — solo ellas pueden recibir
+        // la invitación formal de Fase 2. Las que aún no se registraron quedan pendientes
+        // (se cuentan en "omitidos_sin_ra14" para que Jurídica sepa que faltan por registrarse).
         const todasRes = await pool.query(
             `SELECT id, proponente_email, proponente_nombre, token
-             FROM convocatoria_invitaciones WHERE convocatoria_id = $1::uuid`,
+             FROM convocatoria_invitaciones
+             WHERE convocatoria_id = $1::uuid AND tipo_documento IS NOT NULL AND link_enviado_en IS NULL`,
             [id]
         );
+        const omitidosRes = await pool.query(
+            `SELECT COUNT(*)::int as total FROM convocatoria_invitaciones WHERE convocatoria_id = $1::uuid AND tipo_documento IS NULL`,
+            [id]
+        );
+        const omitidosSinRA14 = omitidosRes.rows[0]?.total || 0;
 
         const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
         const enlacesParaEnviar = todasRes.rows.map(inv => ({
@@ -6391,21 +6486,26 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
         // 5. Preparar canal de envío de correo
         const envio = await prepararEnvioCorreo();
 
-        // 6. Marcar link_enviado_en + registrar que la Fase 2 fue enviada + cerrar registro público
+        // 6. Marcar link_enviado_en (solo para los que sí recibieron el enlace, con RA1-4 completado)
         await pool.query(
             `UPDATE convocatoria_invitaciones SET link_enviado_en = NOW()
-             WHERE convocatoria_id = $1::uuid AND link_enviado_en IS NULL`,
+             WHERE convocatoria_id = $1::uuid AND link_enviado_en IS NULL AND tipo_documento IS NOT NULL`,
             [id]
         ).catch(() => { });
-        // Cerrar el link público automáticamente: ya no se aceptan más registros
-        await pool.query(
-            `UPDATE convocatorias
-             SET fase_invitacion_enviada = TRUE,
-                 invitacion_enviada_en   = NOW(),
-                 link_publico_activo     = FALSE
-             WHERE id = $1::uuid`,
-            [id]
-        ).catch(() => { });
+        // Cerrar el link público y marcar la Fase 2 como enviada SOLO si ya no quedan
+        // proponentes pendientes de completar su registro RA1-4: si aún faltan, el link
+        // público sigue activo para que puedan registrarse, y Jurídica puede volver a
+        // llamar este mismo endpoint más adelante para notificarles cuando ya se registren.
+        if (omitidosSinRA14 === 0) {
+            await pool.query(
+                `UPDATE convocatorias
+                 SET fase_invitacion_enviada = TRUE,
+                     invitacion_enviada_en   = NOW(),
+                     link_publico_activo     = FALSE
+                 WHERE id = $1::uuid`,
+                [id]
+            ).catch(() => { });
+        }
 
         // 7. Preparar adjunto del documento si existe
         const docAttachments = [];
@@ -6529,7 +6629,9 @@ app.post('/api/convocatorias/:id/enviar-invitacion-masiva', async (req, res) => 
             ok: true,
             total_enviados: enlacesParaEnviar.length,
             nuevos_agregados: nuevasInvitaciones.length,
-            mensaje: `Invitación enviada a ${enlacesParaEnviar.length} proponente(s). ${nuevasInvitaciones.length} nuevo(s) agregado(s) desde la solicitud.`,
+            omitidos_sin_ra14: omitidosSinRA14,
+            mensaje: `Invitación enviada a ${enlacesParaEnviar.length} proponente(s). ${nuevasInvitaciones.length} nuevo(s) agregado(s) desde la solicitud.`
+                + (omitidosSinRA14 > 0 ? ` ${omitidosSinRA14} proponente(s) no recibieron la invitación porque aún no completan su registro RA1-4 en el link público.` : ''),
             modo_envio: envio.modo,
             invitaciones: enlacesParaEnviar,
             previews,
@@ -6552,7 +6654,7 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
         await ensureConvocatoriasStorage();
 
         const result = await pool.query(
-            `SELECT ci.id, ci.proponente_email, ci.proponente_nombre, ci.token,
+            `SELECT ci.id, ci.proponente_email, ci.proponente_nombre, ci.token, ci.tipo_documento,
                     c.asunto, c.fecha_limite, c.descripcion_requisitos,
                     s.objeto
              FROM convocatoria_invitaciones ci
@@ -6565,6 +6667,15 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
             return res.status(404).json({ error: 'Invitación no encontrada.' });
         }
         const inv = result.rows[0];
+
+        // El proponente debe haber completado su registro RA1-4 en el link público
+        // antes de poder recibir la invitación formal de Fase 2.
+        if (!inv.tipo_documento) {
+            return res.status(409).json({
+                error: 'Este proponente aún no ha completado su registro (RA1-4) en el link público. Debe registrarse primero antes de poder enviarle la invitación.',
+                requiere_ra14: true,
+            });
+        }
 
         // Verificar que el plazo no haya vencido
         if (new Date() > new Date(inv.fecha_limite)) {

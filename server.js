@@ -607,12 +607,25 @@ app.get('/api/solicitudes/:id', async (req, res) => {
             }
         }
 
-        // 2. Datos de modalidad
+        // 2. Datos de modalidad — modalidad_seleccion y justificacion_cd (Causal
+        // de contratación) solo existen en esta tabla, no en `solicitudes`.
+        // Se aplanan al nivel superior porque DetallePlaneacionContractual.tsx
+        // (usado por Gerente, Financiera, Jurídica y Riesgos) lee s.modalidad_seleccion
+        // directamente, no s.info_modalidad.modalidad_seleccion.
         const modalidadResult = await pool.query(
             `SELECT * FROM solicitudes_modalidad_directa WHERE solicitud_id = $1`,
             [id]
         );
         solicitud.info_modalidad = modalidadResult.rows[0] || {};
+        // Solo modalidad_seleccion/justificacion_cd (Causal de contratación): no
+        // copiar el resto de la fila (id/solicitud_id/actualizado_en pisarían los
+        // del registro principal, y fecha_estimada_* ya viven en `solicitudes`
+        // para todas las modalidades — sobreescribirlas aquí las borraría
+        // cuando esta tabla no tiene fila, como en Invitación/TDR).
+        if (modalidadResult.rows[0]) {
+            solicitud.modalidad_seleccion = modalidadResult.rows[0].modalidad_seleccion;
+            solicitud.justificacion_cd = modalidadResult.rows[0].justificacion_cd;
+        }
 
         // 3. Datos avanzados (Jurídica)
         // Esta tabla puede no existir aún en algunas bases (según migraciones aplicadas),

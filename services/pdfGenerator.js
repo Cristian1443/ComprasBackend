@@ -13,6 +13,11 @@
 import PDFDocument from 'pdfkit';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ASSETS_DIR = path.join(__dirname, '..', 'assets');
 
 const COLOR_NARANJA = '#E84922';
 const COLOR_AZUL = '#1f4e79';
@@ -116,70 +121,142 @@ export function generarPdfFormatoPlaneacion(solicitud, etapa, destinoPath) {
 }
 
 /**
- * Genera el PDF del Acta de Comité (firma Directora + Secretaria).
+ * Genera el PDF del Acta de Comité — réplica fiel del acta oficial que se ve
+ * en pantalla y se imprime (membrete, Asistentes/Invitados, Orden del día,
+ * Desarrollo, ficha técnica por solicitud, Conclusión y cierre, firmas).
+ *
+ * @param {object} opts
+ * @param {{ solicitud: object, discusion: string, decision: string }[]} opts.solicitudes
+ * @param {string} opts.actaNumero
+ * @param {string|Date} opts.fechaSesion
+ * @param {object[]} opts.participantes - { nombre, cargo, representaA?, tipo: 'asistente'|'invitado' }
+ * @param {string} [opts.desarrollo] - Texto libre de la sección "Desarrollo"
+ * @param {string} [opts.conclusion] - Texto libre de la sección "Conclusión y cierre"
+ * @param {{ nombre: string, cargo: string }[]} opts.firmantes - [Directora, Secretaria]
+ * @param {string} opts.destinoPath
  */
-export function generarPdfActaComite({ solicitud, actaNumero, fechaSesion, participantes, discusion, decision, destinoPath }) {
+export function generarPdfActaComite({ solicitudes, actaNumero, fechaSesion, participantes, desarrollo, conclusion, firmantes, destinoPath }) {
     return new Promise((resolve, reject) => {
         try {
             fs.mkdirSync(path.dirname(destinoPath), { recursive: true });
-            const doc = new PDFDocument({ size: 'A4', margin: 40, info: {
-                Title: `Acta Comité ${actaNumero} - ${solicitud.codigo}`,
-                Author: 'Invest in Bogotá',
-            }});
+            const doc = new PDFDocument({
+                size: 'A4', margin: 40, bufferPages: true, info: {
+                    Title: `Acta Comité ${actaNumero}`,
+                    Author: 'Invest in Bogotá',
+                },
+            });
             const stream = fs.createWriteStream(destinoPath);
             doc.pipe(stream);
 
-            doc.fillColor(COLOR_AZUL).fontSize(20).font('Helvetica-Bold')
-                .text('ACTA DE COMITÉ DE CONTRATACIÓN', { align: 'center' });
-            doc.fillColor(COLOR_GRIS_CLARO).fontSize(11).font('Helvetica')
-                .text(`Sesión Nº ${actaNumero}`, { align: 'center' });
-            doc.text(formatearFecha(fechaSesion || new Date()), { align: 'center' });
-            doc.moveDown(1);
+            doc.on('pageAdded', () => {
+                dibujarEncabezadoActa(doc);
+                doc.y = 110;
+            });
+            dibujarEncabezadoActa(doc);
+            doc.y = 110;
 
-            doc.moveTo(40, doc.y).lineTo(555, doc.y).strokeColor(COLOR_AZUL).lineWidth(2).stroke();
+            const fecha = fechaSesion ? new Date(fechaSesion) : new Date();
+            const fechaLarga = fecha.toLocaleDateString('es-CO', {
+                weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+            });
+            const fechaCapitalizada = fechaLarga.charAt(0).toUpperCase() + fechaLarga.slice(1);
+            const hora = fecha.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' });
+
+            doc.fillColor('#000000').fontSize(13).font('Helvetica-Bold')
+                .text(`ACTA No. ${actaNumero} COMITÉ DE CONTRATACIÓN`, { align: 'center' });
+            doc.moveDown(0.3);
+            doc.fontSize(11).font('Helvetica-Bold')
+                .text('REUNIÓN DEL COMITÉ DE CONTRATACIÓN DE LA CORPORACIÓN PARA EL DESARROLLO Y '
+                    + 'LA PRODUCTIVIDAD BOGOTÁ REGIÓN - REGIÓN DINÁMICA - INVEST IN BOGOTÁ', { align: 'center' });
             doc.moveDown(0.8);
 
-            // Participantes
-            seccion(doc, 'Participantes del comité');
-            (participantes || []).forEach((p, i) => {
-                doc.fontSize(10).fillColor(COLOR_GRIS).font('Helvetica')
-                    .text(`${i + 1}. ${p.nombre}${p.cargo ? ` — ${p.cargo}` : ''}${p.representaA ? ` (reemplaza a ${p.representaA})` : ''}`);
+            doc.fontSize(11).font('Helvetica').fillColor('#000000')
+                .text(`En la ciudad de Bogotá, el ${fechaCapitalizada}, siendo las ${hora}, se reunió el `
+                    + 'Comité de Contratación de la Corporación para el Desarrollo y la Productividad, '
+                    + 'Bogotá - Región Invest in Bogotá (en adelante, IIB), de manera presencial. '
+                    + 'Esta sesión se llevó a cabo previa convocatoria de la Jefe Administrativa y de '
+                    + 'Talento Humano delegada por la Directora Ejecutiva, conforme a lo dispuesto en '
+                    + 'la Política de Compras y Contratación.', { align: 'justify' });
+            doc.moveDown(0.6);
+
+            const todosParticipantes = participantes || [];
+            const asistentes = todosParticipantes.filter((p) => (p.tipo ? p.tipo === 'asistente' : !p.esInvitado));
+            const invitados = todosParticipantes.filter((p) => (p.tipo ? p.tipo === 'invitado' : !!p.esInvitado));
+
+            if (asistentes.length > 0) {
+                doc.font('Helvetica-Bold').fontSize(11).text('Asistentes:');
+                asistentes.forEach((p) => {
+                    doc.font('Helvetica').text(`${p.nombre} – ${p.cargo}${p.representaA ? ` (en representación de ${p.representaA})` : ''}`);
+                });
+                doc.moveDown(0.4);
+            }
+            if (invitados.length > 0) {
+                doc.font('Helvetica-Bold').fontSize(11).text('Invitados:');
+                invitados.forEach((p) => {
+                    doc.font('Helvetica').text(`${p.nombre} – ${p.cargo}`);
+                });
+                doc.moveDown(0.4);
+            }
+
+            listaOrdenada(doc, ['Orden del día', 'Contexto y discusión caso', 'Conclusión y cierre']);
+
+            doc.moveDown(0.3);
+            doc.font('Helvetica-Bold').fontSize(11).text('Desarrollo:');
+            doc.moveDown(0.2);
+            if (String(desarrollo || '').trim()) {
+                String(desarrollo).split(/\n{2,}|\n/).filter((par) => par.trim()).forEach((par) => {
+                    parrafo(doc, par.trim());
+                });
+            }
+
+            listaOrdenada(doc, solicitudes.map(({ solicitud }, i) => solicitud.titulo_contrato || solicitud.objeto || `Solicitud ${i + 1}`));
+
+            solicitudes.forEach(({ solicitud, discusion }, idx) => {
+                doc.moveDown(0.6);
+                doc.font('Helvetica-Bold').fontSize(11).text(`Solicitud N. ${idx + 1}`);
+                doc.text(solicitud.titulo_contrato || solicitud.objeto || 'Sin objeto registrado');
+                doc.moveDown(0.2);
+
+                const origenPpto = solicitud.rubro || solicitud.rubro_presupuestal || solicitud.gerencia_nombre || 'N/A';
+                const supervisor = solicitud.supervision_nombre || solicitud.solicitante_nombre || 'N/A';
+                doc.font('Helvetica').fontSize(11);
+                filaBold(doc, 'Monto:', montoActaTexto(solicitud));
+                filaBold(doc, 'Plazo:', plazoTexto(solicitud));
+                filaBold(doc, 'Origen de PPTO:', origenPpto);
+                filaBold(doc, 'Supervisor Contrato:', supervisor);
+                filaBold(doc, 'Causal de contratación:', causalComiteTexto(solicitud) || 'No registrada');
+                doc.moveDown(0.3);
+
+                doc.font('Helvetica-Bold').text('Contexto y descripción de la necesidad:');
+                parrafo(doc, solicitud.justificacion || solicitud.descripcion_necesidad_detalle || 'Sin descripción registrada.');
+
+                doc.font('Helvetica-Bold').text('Discusión');
+                parrafo(doc, discusion || '—');
             });
 
-            // Solicitud discutida
-            doc.moveDown(0.8);
-            seccion(doc, 'Solicitud evaluada');
-            fila(doc, 'Código:', solicitud.codigo || '—');
-            fila(doc, 'Objeto:', solicitud.objeto || '—');
-            fila(doc, 'Solicitante:', solicitud.solicitante_nombre || '—');
-            fila(doc, 'Gerencia:', solicitud.gerencia_nombre || '—');
-            fila(doc, 'Monto:', valorTexto(solicitud));
-            fila(doc, 'Modalidad:', String(solicitud.modalidad || '—').toUpperCase());
+            doc.moveDown(0.6);
+            doc.font('Helvetica-Bold').fontSize(11).text('2.   Conclusión y cierre');
+            doc.moveDown(0.2);
+            if (String(conclusion || '').trim()) {
+                String(conclusion).split(/\n{2,}|\n/).filter((par) => par.trim()).forEach((par) => {
+                    parrafo(doc, par.trim());
+                });
+            }
 
-            // Discusión
-            doc.moveDown(0.8);
-            seccion(doc, 'Discusión del comité');
-            parrafo(doc, discusion || 'Sin observaciones registradas.');
+            listaOrdenada(doc, solicitudes.map(({ solicitud }, i) => solicitud.objeto || `Solicitud ${i + 1}`));
 
-            // Decisión
-            doc.moveDown(0.5);
-            seccion(doc, 'Decisión');
-            const decisionLabel = decision === 'aprobada' ? 'APROBADA'
-                : decision === 'rechazada' ? 'RECHAZADA'
-                : decision === 'en_revision' ? 'EN REVISIÓN' : '—';
-            const decisionColor = decision === 'aprobada' ? '#065F46'
-                : decision === 'rechazada' ? '#991B1B'
-                : '#92400E';
-            doc.fontSize(14).fillColor(decisionColor).font('Helvetica-Bold').text(decisionLabel);
+            doc.moveDown(1);
+            doc.font('Helvetica').fontSize(11).text('En constancia firman:');
+            doc.moveDown(1.2);
 
-            // Bloque firma (Directora + Secretaria)
-            doc.moveDown(2);
-            bloqueFirmaComite(doc);
+            if (doc.y > doc.page.height - 160) doc.addPage();
+            bloqueFirmaComite(doc, firmantes || []);
 
-            // Pie
-            doc.fontSize(8).fillColor(COLOR_GRIS_CLARO)
-                .text(`Acta ${actaNumero} · Generado el ${formatearFechaHora(new Date())}`,
-                    40, doc.page.height - 50, { align: 'center', width: 515 });
+            const rango = doc.bufferedPageRange();
+            for (let i = rango.start; i < rango.start + rango.count; i++) {
+                doc.switchToPage(i);
+                dibujarPieActa(doc, actaNumero);
+            }
 
             doc.end();
             stream.on('finish', () => resolve(destinoPath));
@@ -480,38 +557,120 @@ function bloqueFirma(doc, etapa, solicitud) {
     doc.y = y + boxH + 12;
 }
 
-function bloqueFirmaComite(doc) {
-    doc.fillColor(COLOR_GRIS).fontSize(11).font('Helvetica-Bold')
-        .text('FIRMAS DEL COMITÉ');
-    doc.moveDown(0.3);
-    doc.fillColor(COLOR_GRIS).fontSize(10).font('Helvetica')
-        .text('Se firma electrónicamente por la Directora y la Secretaria del Comité de Contratación.', {
-            align: 'justify',
-        });
-    doc.moveDown(2);
+function bloqueFirmaComite(doc, firmantes) {
+    const directora = firmantes[0] || { nombre: '___________________________', cargo: 'Directora de Comité' };
+    const secretaria = firmantes[1] || { nombre: '___________________________', cargo: 'Secretaria de Comité' };
 
     const y = doc.y;
-    // Columna izq (Directora)
+    // Columna izq (Directora) — el tag {{Sig_es_:signerN:signature}} lo reemplaza
+    // Adobe Sign por el campo de firma real; el texto no queda visible en el PDF final.
     doc.fontSize(11).fillColor('#000000').font('Helvetica')
-        .text('{{Sig_es_:signer1:signature}}', 60, y);
-    doc.moveTo(60, y + 30).lineTo(260, y + 30).strokeColor('#000').lineWidth(0.5).stroke();
-    doc.fontSize(9).fillColor(COLOR_GRIS_CLARO)
-        .text('Firma electrónica', 60, y + 35, { width: 200 });
-    doc.fillColor(COLOR_GRIS).fontSize(10).font('Helvetica-Bold')
-        .text('Directora', 60, y + 47, { width: 200 });
-    doc.fontSize(9).fillColor(COLOR_GRIS_CLARO).font('Helvetica')
-        .text('Comité de Contratación', 60, y + 60, { width: 200 });
+        .text('{{Sig_es_:signer1:signature}}', 60, y, { width: 200 });
+    doc.moveTo(60, y + 52).lineTo(260, y + 52).strokeColor('#1f2937').lineWidth(1.5).stroke();
+    doc.fillColor('#000000').fontSize(11).font('Helvetica-Bold')
+        .text(directora.nombre, 60, y + 57, { width: 200 });
+    doc.fontSize(11).fillColor('#000000').font('Helvetica')
+        .text(directora.cargo, 60, y + 73, { width: 200 });
 
     // Columna der (Secretaria)
     doc.fontSize(11).fillColor('#000000').font('Helvetica')
-        .text('{{Sig_es_:signer2:signature}}', 310, y);
-    doc.moveTo(310, y + 30).lineTo(510, y + 30).strokeColor('#000').lineWidth(0.5).stroke();
-    doc.fontSize(9).fillColor(COLOR_GRIS_CLARO)
-        .text('Firma electrónica', 310, y + 35, { width: 200 });
-    doc.fillColor(COLOR_GRIS).fontSize(10).font('Helvetica-Bold')
-        .text('Secretaria del Comité', 310, y + 47, { width: 200 });
-    doc.fontSize(9).fillColor(COLOR_GRIS_CLARO).font('Helvetica')
-        .text('Comité de Contratación', 310, y + 60, { width: 200 });
+        .text('{{Sig_es_:signer2:signature}}', 310, y, { width: 200 });
+    doc.moveTo(310, y + 52).lineTo(510, y + 52).strokeColor('#1f2937').lineWidth(1.5).stroke();
+    doc.fillColor('#000000').fontSize(11).font('Helvetica-Bold')
+        .text(secretaria.nombre, 310, y + 57, { width: 200 });
+    doc.fontSize(11).fillColor('#000000').font('Helvetica')
+        .text(secretaria.cargo, 310, y + 73, { width: 200 });
+
+    doc.y = y + 95;
+}
+
+/** Dibuja el membrete institucional (logo IIB arriba a la derecha) en la página actual. */
+function dibujarEncabezadoActa(doc) {
+    try {
+        const logoPath = path.join(ASSETS_DIR, 'logo-iib-oficial.png');
+        if (fs.existsSync(logoPath)) {
+            doc.image(logoPath, doc.page.width - 40 - 90, 28, { width: 90 });
+        }
+    } catch { /* si falla el logo, seguimos sin membrete */ }
+}
+
+/** Dibuja el pie institucional (silueta de Bogotá + datos de contacto + código de documento). */
+function dibujarPieActa(doc, actaNumero) {
+    const y = doc.page.height - 66;
+    try {
+        const skylinePath = path.join(ASSETS_DIR, 'bogota-skyline.png');
+        if (fs.existsSync(skylinePath)) {
+            doc.image(skylinePath, 40, y - 4, { height: 36 });
+        }
+    } catch { /* ignorar si falla la imagen */ }
+    doc.fontSize(7.5).fillColor(COLOR_NARANJA).font('Helvetica-Bold')
+        .text('Agencia de promoción de inversión y eventos', 130, y, { width: 340 });
+    doc.fontSize(7.5).fillColor(COLOR_GRIS_CLARO).font('Helvetica')
+        .text('Calle 67 # 8-32/44; piso 4; Bogotá, D.C.  ·  (+57) 317 7806158  ·  www.investinbogota.org', 130, y + 10, { width: 340 });
+    doc.fontSize(7).fillColor(COLOR_GRIS_CLARO)
+        .text(`F13-PR-GD-01. V02. · Acta ${actaNumero}`, 40, doc.page.height - 22);
+}
+
+/** Lista numerada simple (1. 2. 3. ...). */
+function listaOrdenada(doc, items) {
+    doc.font('Helvetica').fontSize(11).fillColor('#000000');
+    (items || []).forEach((texto, i) => {
+        doc.text(`${i + 1}. ${texto}`, { indent: 8 });
+    });
+    doc.moveDown(0.3);
+}
+
+/** Fila "Etiqueta: valor" en una sola línea, etiqueta en negrita. */
+function filaBold(doc, label, value) {
+    doc.font('Helvetica-Bold').text(label, { continued: true }).font('Helvetica').text(`  ${value ?? '—'}`);
+}
+
+/** Monto del acta: usa presupuesto certificado si existe, si no el valor estimado (igual que en pantalla). */
+function montoActaTexto(s) {
+    if (s.presupuesto_aprobado != null && !Number.isNaN(Number(s.presupuesto_aprobado)) && Number(s.presupuesto_aprobado) > 0) {
+        return new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(Number(s.presupuesto_aprobado));
+    }
+    const monedaSol = String(s.moneda || 'COP').toUpperCase();
+    const texto = monedaSol === 'USD' ? s.valor_moneda_usd_texto
+        : monedaSol === 'EUR' ? s.valor_moneda_eur_texto
+        : s.valor_moneda_cop_texto;
+    if (texto) return `${monedaSol} ${texto}`;
+    const monto = Number(s.valor_en_cop || s.valor_estimado || 0);
+    const currency = monedaSol === 'COMBINADA' ? 'COP' : monedaSol;
+    try {
+        return new Intl.NumberFormat('es-CO', { style: 'currency', currency, maximumFractionDigits: 0 }).format(monto);
+    } catch {
+        return new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(monto);
+    }
+}
+
+/** Causal de contratación mostrada en el acta — mismo texto largo que ve Secretaría en pantalla. */
+const CAUSALES_DIRECTA_LARGO = {
+    i: 'I. Cuando no existen otros proveedores para el suministro del bien y/o servicio por ser titular de derechos de propiedad intelectual o por ser proveedor exclusivo en el territorio nacional.',
+    ii: 'II. Cuando por razones técnicas sólo se pueda contratar con un proveedor.',
+    iii_a: 'III. Cuando se declare desierta la convocatoria para la adquisición del bien y/o servicio por dos (2) veces consecutivas, por falta de proponentes.',
+    iv: 'IV. Cuando el suministro de los bienes y servicios, por su especialidad, sólo puede ser ejecutado y/o suministrado por una determinada persona natural o jurídica (Intuito Personae).',
+    v: 'V. Cuando se deba asegurar disponibilidad de manera continua en servicios de alojamiento o transporte.',
+    vi: 'VI. En los servicios bajo la modalidad de suscripción, afiliación o inscripción a publicaciones físicas o digitales que sean de interés de La Corporación.',
+    vii: 'VII. Contratos de arrendamiento de bienes inmuebles.',
+    viii: 'VIII. Contratación de productos financieros y seguros.',
+    ix: 'IX. Contratación de bienes y servicios relacionados con capacitaciones y Sistema de Gestión de Seguridad y Salud en el Trabajo (SG-SST).',
+    x: 'X. Cuando sea requerido por urgencia manifiesta de contar con el bien y/o servicio de manera inmediata.',
+};
+
+function causalComiteTexto(solicitud) {
+    const modalidad = String(solicitud?.modalidad || '').trim().toLowerCase();
+    if (modalidad === 'invitacion') return 'Por invitación';
+    if (modalidad === 'tdr') return 'Por términos de referencia';
+    const codigo = String(solicitud?.modalidad_seleccion || '').toLowerCase().trim();
+    if (codigo && CAUSALES_DIRECTA_LARGO[codigo]) return CAUSALES_DIRECTA_LARGO[codigo];
+    if (codigo) return codigo;
+    const justificacion = String(solicitud?.justificacion_cd || '').trim();
+    if (justificacion) return justificacion;
+    const criterios = String(solicitud?.criterios_contratacion || '').trim();
+    if (criterios) return criterios;
+    if (modalidad && modalidad !== 'directa') return `Contratación ${solicitud?.modalidad}`;
+    return '';
 }
 
 // ============================================================
@@ -572,94 +731,8 @@ function mapearCausal(codigo) {
     return CAUSALES[String(codigo).toLowerCase()] || String(codigo);
 }
 
-/**
- * Genera el PDF del acta de comité para múltiples solicitudes en una sola sesión.
- * @param {object} opts
- * @param {{ solicitud: object, discusion: string, decision: string }[]} opts.solicitudes
- * @param {string} opts.actaNumero
- * @param {string|Date} opts.fechaSesion
- * @param {{ nombre: string, cargo: string, representaA?: string }[]} opts.participantes
- * @param {string} opts.destinoPath
- */
-export function generarPdfActaComiteMultiple({ solicitudes, actaNumero, fechaSesion, participantes, destinoPath }) {
-    return new Promise((resolve, reject) => {
-        try {
-            fs.mkdirSync(path.dirname(destinoPath), { recursive: true });
-            const doc = new PDFDocument({ size: 'A4', margin: 40, info: {
-                Title: `Acta Comité ${actaNumero}`,
-                Author: 'Invest in Bogotá',
-            }});
-            const stream = fs.createWriteStream(destinoPath);
-            doc.pipe(stream);
-
-            doc.fillColor(COLOR_AZUL).fontSize(18).font('Helvetica-Bold')
-                .text('ACTA DE COMITÉ DE CONTRATACIÓN', { align: 'center' });
-            doc.fillColor(COLOR_GRIS_CLARO).fontSize(11).font('Helvetica')
-                .text(`Sesión Nº ${actaNumero}`, { align: 'center' });
-            doc.text(formatearFecha(fechaSesion || new Date()), { align: 'center' });
-            doc.moveDown(1);
-
-            doc.moveTo(40, doc.y).lineTo(555, doc.y).strokeColor(COLOR_AZUL).lineWidth(2).stroke();
-            doc.moveDown(0.8);
-
-            // Participantes
-            seccion(doc, 'Participantes del comité');
-            (participantes || []).forEach((p, i) => {
-                doc.fontSize(10).fillColor(COLOR_GRIS).font('Helvetica')
-                    .text(`${i + 1}. ${p.nombre}${p.cargo ? ` — ${p.cargo}` : ''}${p.representaA ? ` (reemplaza a ${p.representaA})` : ''}`);
-            });
-
-            // Solicitudes
-            solicitudes.forEach(({ solicitud, discusion, decision }, idx) => {
-                doc.moveDown(1);
-                doc.moveTo(40, doc.y).lineTo(555, doc.y).strokeColor('#E5E7EB').lineWidth(0.5).stroke();
-                doc.moveDown(0.5);
-
-                doc.fillColor(COLOR_AZUL).fontSize(12).font('Helvetica-Bold')
-                    .text(`Solicitud ${idx + 1}: ${solicitud.objeto || '—'}`);
-                doc.moveDown(0.3);
-
-                fila(doc, 'Código:', solicitud.codigo || '—');
-                fila(doc, 'Solicitante:', solicitud.solicitante_nombre || '—');
-                fila(doc, 'Gerencia:', solicitud.gerencia_nombre || '—');
-                fila(doc, 'Monto:', valorTexto(solicitud));
-                fila(doc, 'Modalidad:', String(solicitud.modalidad || '—').toUpperCase());
-
-                doc.moveDown(0.5);
-                seccion(doc, 'Discusión');
-                parrafo(doc, discusion || 'Sin observaciones registradas.');
-
-                doc.moveDown(0.3);
-                seccion(doc, 'Decisión');
-                const decisionLabel = decision === 'aprobada' ? 'APROBADA'
-                    : decision === 'rechazada' ? 'RECHAZADA'
-                    : decision === 'en_revision' ? 'EN REVISIÓN' : '—';
-                const decisionColor = decision === 'aprobada' ? '#065F46'
-                    : decision === 'rechazada' ? '#991B1B'
-                    : '#92400E';
-                doc.fontSize(12).fillColor(decisionColor).font('Helvetica-Bold').text(decisionLabel);
-            });
-
-            // Bloque de firmas
-            doc.moveDown(2);
-            bloqueFirmaComite(doc);
-
-            doc.fontSize(8).fillColor(COLOR_GRIS_CLARO)
-                .text(`Acta ${actaNumero} · Generado el ${formatearFechaHora(new Date())}`,
-                    40, doc.page.height - 50, { align: 'center', width: 515 });
-
-            doc.end();
-            stream.on('finish', () => resolve(destinoPath));
-            stream.on('error', reject);
-        } catch (e) {
-            reject(e);
-        }
-    });
-}
-
 export default {
     generarPdfFormatoPlaneacion,
     generarPdfActaComite,
-    generarPdfActaComiteMultiple,
     generarPdfEvaluacionProveedor,
 };

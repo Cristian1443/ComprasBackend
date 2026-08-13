@@ -34,7 +34,6 @@ import {
 import {
     generarPdfFormatoPlaneacion,
     generarPdfActaComite,
-    generarPdfActaComiteMultiple,
     generarPdfEvaluacionProveedor,
 } from '../services/pdfGenerator.js';
 import { subirArchivoContrato, obtenerEstadoConexion as obtenerEstadoConexionGraph } from '../services/graphAppService.js';
@@ -246,7 +245,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
         const { id, etapa } = req.params;
         const {
             actaNumero, fechaSesion, participantes, discusion, decision,
-            solicitudesMultiples, actaId,
+            solicitudesMultiples, actaId, desarrollo, conclusion,
             firmanteJuridica, iniciadoPor,
         } = req.body || {};
 
@@ -329,30 +328,27 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                 const fechaActa = fechaSesion || new Date().toISOString();
                 const participantesActa = participantes || [];
 
-                if (Array.isArray(solicitudesMultiples) && solicitudesMultiples.length > 1) {
-                    const items = [];
+                let items;
+                if (Array.isArray(solicitudesMultiples) && solicitudesMultiples.length > 0) {
+                    items = [];
                     for (const item of solicitudesMultiples) {
                         const sol = await obtenerSolicitudCompleta(item.id);
                         if (sol) items.push({ solicitud: sol, discusion: item.discusion || '', decision: item.decision || 'aprobada' });
                     }
-                    await generarPdfActaComiteMultiple({
-                        solicitudes: items,
-                        actaNumero: numActa,
-                        fechaSesion: fechaActa,
-                        participantes: participantesActa,
-                        destinoPath: pdfPath,
-                    });
                 } else {
-                    await generarPdfActaComite({
-                        solicitud,
-                        actaNumero: numActa,
-                        fechaSesion: fechaActa,
-                        participantes: participantesActa,
-                        discusion: discusion || '',
-                        decision: decision || 'aprobada',
-                        destinoPath: pdfPath,
-                    });
+                    items = [{ solicitud, discusion: discusion || '', decision: decision || 'aprobada' }];
                 }
+
+                await generarPdfActaComite({
+                    solicitudes: items,
+                    actaNumero: numActa,
+                    fechaSesion: fechaActa,
+                    participantes: participantesActa,
+                    desarrollo: desarrollo || '',
+                    conclusion: conclusion || '',
+                    firmantes: firmantes.map((f) => ({ nombre: f.nombre, cargo: f.cargo })),
+                    destinoPath: pdfPath,
+                });
             } else {
                 await generarPdfFormatoPlaneacion(solicitud, etapa, pdfPath);
             }

@@ -539,7 +539,12 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
     });
 
     router.put('/configuracion/adobe-sign', async (req, res) => {
-        const { client_id, client_secret, refresh_token, integration_key, api_base_url, modo } = req.body || {};
+        let { client_id, client_secret, refresh_token, integration_key, api_base_url, modo } = req.body || {};
+        if (typeof client_id === 'string') client_id = client_id.trim();
+        if (typeof client_secret === 'string') client_secret = client_secret.trim();
+        if (typeof refresh_token === 'string') refresh_token = refresh_token.trim();
+        if (typeof integration_key === 'string') integration_key = integration_key.trim();
+        if (typeof api_base_url === 'string') api_base_url = api_base_url.trim();
         try {
             await pool.query(
                 `UPDATE configuracion_adobe_sign

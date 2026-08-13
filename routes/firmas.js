@@ -689,6 +689,10 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             const expira = new Date(Date.now() + ttl * 1000);
             const apiPoint = tokenData.api_access_point ? tokenData.api_access_point.replace(/\/$/, '') : null;
 
+            // Una conexión OAuth exitosa reemplaza cualquier Integration Key vieja —
+            // obtenerAccessToken() en services/adobeSign.js le da prioridad a integration_key
+            // sobre el refresh_token, así que si no se limpia aquí, el token nuevo nunca se usaría
+            // y el error de token inválido/expirado seguiría ocurriendo tras "conectar" OAuth.
             await pool.query(
                 `UPDATE configuracion_adobe_sign
                     SET refresh_token = $1,
@@ -696,6 +700,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                         access_expira_en = $3,
                         modo = 'produccion',
                         api_base_url = COALESCE($4, api_base_url),
+                        integration_key = NULL,
                         actualizado_en = NOW()
                   WHERE id = 1`,
                 [refresh, access, expira, apiPoint]

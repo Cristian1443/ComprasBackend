@@ -4348,7 +4348,7 @@ app.patch('/api/supervisor/facturas/:id/certificar', async (req, res) => {
 app.get('/api/gerente/facturas', async (_req, res) => {
     try {
         const result = await pool.query(
-            `SELECT fc.*, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto
+            `SELECT fc.*, s.codigo AS contrato_codigo, s.objeto AS contrato_objeto, s.titulo_contrato AS contrato_titulo
              FROM facturas_contrato fc
              JOIN solicitudes s ON s.id = fc.solicitud_id
              ORDER BY fc.creado_en DESC`
@@ -4372,7 +4372,7 @@ app.get('/api/gerente/historial-facturas', async (req, res) => {
                 fc.id, fc.no_factura_cxc, fc.no_contrato_oc, fc.numero_ap, fc.concepto, fc.valor,
                 fc.fecha_factura, fc.estado, fc.aprobado_gerente, fc.comentario_gerente,
                 fc.actualizado_en, fc.creado_en,
-                s.codigo AS contrato_codigo, s.objeto AS contrato_objeto
+                s.codigo AS contrato_codigo, s.objeto AS contrato_objeto, s.titulo_contrato AS contrato_titulo
             FROM facturas_contrato fc
             JOIN solicitudes s ON s.id = fc.solicitud_id
             WHERE s.gerencia_id = $1

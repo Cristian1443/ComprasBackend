@@ -64,8 +64,13 @@ async function leerConfigAdobe(pool) {
 }
 
 function tokenEndpointsOAuth(apiBaseUrl) {
+    // El código de autorización lo emite el mismo host usado para /public/oauth/v2
+    // (oauthAuthorizeBase) — el intercambio de token debe probarse ahí primero,
+    // porque Adobe ya no acepta ese código en los hosts viejos de abajo.
+    const authBase = oauthAuthorizeBase(apiBaseUrl);
     const shard = (apiBaseUrl || 'https://api.na4.adobesign.com').replace(/\/$/, '');
     const endpoints = [
+        `${authBase}/oauth/v2/token`,
         'https://secure.echosign.com/oauth/v2/token',
         `${shard}/oauth/v2/token`,
         'https://secure.na4.adobesign.com/oauth/v2/token',

@@ -482,7 +482,16 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             if (r.rows.length === 0) return res.status(404).json({ error: 'No encontrada' });
             const firma = r.rows[0];
             if (firma.agreement_id) {
-                await cancelarAcuerdo(pool, firma.agreement_id, req.body?.motivo);
+                // Si Adobe ya tiene el acuerdo en un estado terminal (p.ej. alguien
+                // lo canceló directamente desde Adobe Sign), su API de cancelación
+                // responde con error — pero igual debemos marcarlo como cancelado
+                // en nuestra BD, o "Reenviar firma" queda bloqueado para siempre
+                // creyendo que sigue en curso.
+                try {
+                    await cancelarAcuerdo(pool, firma.agreement_id, req.body?.motivo);
+                } catch (err) {
+                    console.warn('[firmas] Adobe rechazó la cancelación (probablemente ya estaba en estado terminal):', err.response?.data || err.message);
+                }
             }
             await pool.query(
                 `UPDATE firmas_documento SET estado = 'rechazado', actualizado_en = NOW(), error_mensaje = $2 WHERE id = $1`,

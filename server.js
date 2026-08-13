@@ -1760,13 +1760,13 @@ app.put('/api/solicitudes/:id/enviar', async (req, res) => {
     const { id } = req.params;
     try {
         const result = await pool.query(
-            `UPDATE solicitudes 
-             SET estado = 'enviado_gerente', 
+            `UPDATE solicitudes
+             SET estado = 'enviado_gerente',
                  fecha_envio_gerente = NOW(),
                  actualizado_en = NOW()
              WHERE id = $1
                AND estado IN ('borrador', 'rechazado_gerente', 'devuelto_al_solicitante', 'rechazado_financiera', 'rechazado_juridica', 'rechazado_comite', 'rechazado_riesgos')
-             RETURNING id, codigo, estado`,
+             RETURNING id, codigo, estado, solicitante_id`,
             [id]
         );
         if (result.rows.length === 0) {
@@ -1778,7 +1778,7 @@ app.put('/api/solicitudes/:id/enviar', async (req, res) => {
             registro_id: solEnv.id, accion: 'UPDATE',
             campo: 'estado', valor_anterior: 'borrador', valor_nuevo: 'enviado_gerente',
             descripcion: `Solicitante envió la solicitud ${solEnv.codigo} al gerente para aprobación`,
-            usuario_id: null, rol_usuario: 'supervisor',
+            usuario_id: req.auth?.usuarioId || solEnv.solicitante_id, rol_usuario: req.auth?.rol || 'supervisor',
             ip_address: getClientIp(req), resultado: 'exitoso'
         });
         return res.json({ success: true, message: 'Solicitud enviada al Gerente de Área', solicitud: solEnv });
@@ -3780,7 +3780,7 @@ app.delete('/api/juridica/solicitudes/:id/documentos/:docId', async (req, res) =
             registro_id: id, accion: 'DELETE',
             campo: 'documentos_json', valor_anterior: docEliminado?.nombre || docId, valor_nuevo: null,
             descripcion: `Eliminó documento jurídico "${docEliminado?.nombre || docId}" de la solicitud ${id}`,
-            usuario_id: null, rol_usuario: 'juridica',
+            usuario_id: req.auth?.usuarioId || null, rol_usuario: req.auth?.rol || 'juridica',
             ip_address: getClientIp(req), resultado: 'exitoso'
         });
 
@@ -6760,7 +6760,7 @@ app.post('/api/convocatorias/:convId/invitaciones/:invId/enviar-link', async (re
             registro_id: invId, accion: 'INVITACION_LINK',
             campo: 'link_enviado_en', valor_anterior: null, valor_nuevo: new Date().toISOString(),
             descripcion: `Enlace personal de propuesta enviado a ${inv.proponente_email} para convocatoria "${inv.asunto}"`,
-            usuario_id: null, rol_usuario: 'juridica',
+            usuario_id: req.auth?.usuarioId || null, rol_usuario: req.auth?.rol || 'juridica',
             ip_address: getClientIp(req), resultado: 'exitoso'
         });
 

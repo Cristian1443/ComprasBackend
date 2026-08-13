@@ -410,12 +410,16 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
     // ============================================================
     router.get('/solicitudes/:id/firmas', async (req, res) => {
         try {
+            // DISTINCT ON etapa: cada "Reenviar firma" crea una fila nueva en
+            // firmas_documento en vez de reemplazar la anterior, así que sin
+            // esto el frontend podía terminar mostrando un intento viejo/
+            // cancelado en lugar del acuerdo realmente vigente.
             const r = await pool.query(
-                `SELECT v.*, fd.metadata
+                `SELECT DISTINCT ON (v.etapa) v.*, fd.metadata
                    FROM v_firmas_por_etapa v
                    JOIN firmas_documento fd ON fd.id = v.firma_id
                   WHERE v.solicitud_id = $1
-                  ORDER BY v.firma_id`,
+                  ORDER BY v.etapa, fd.creado_en DESC`,
                 [req.params.id]
             );
             res.json(r.rows);

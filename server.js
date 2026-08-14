@@ -2014,6 +2014,37 @@ app.get('/api/secretaria/actas/historial', async (_req, res) => {
                 cerradaEn: a.cerrada_en || null,
                 firmaId: a.firma_id || null,
             }));
+
+            // Los nombres reales de quien firmó viven en firmantes_documento
+            // (capturados en el momento de enviar a Adobe Sign), no en las
+            // columnas firmante_directora_nombre/firmante_secretaria_nombre de
+            // actas_comite — esas nunca se llenan porque nada las escribe. Sin
+            // este join, el historial no tenía forma de mostrar quién firmó
+            // realmente cada acta.
+            const firmaIds = actasFormales.map((a) => a.firmaId).filter(Boolean);
+            if (firmaIds.length > 0) {
+                try {
+                    const fr = await pool.query(
+                        `SELECT firma_id::text, orden, rol_firma, nombre, cargo, estado, firmado_en
+                         FROM firmantes_documento WHERE firma_id = ANY($1::uuid[]) ORDER BY firma_id, orden`,
+                        [firmaIds]
+                    );
+                    const firmantesPorFirma = {};
+                    for (const row of fr.rows) {
+                        (firmantesPorFirma[row.firma_id] ||= []).push({
+                            rolFirma: row.rol_firma,
+                            nombre: row.nombre,
+                            cargo: row.cargo,
+                            estado: row.estado,
+                            firmadoEn: row.firmado_en,
+                        });
+                    }
+                    actasFormales = actasFormales.map((a) => ({
+                        ...a,
+                        firmantesReales: a.firmaId ? (firmantesPorFirma[a.firmaId] || []) : [],
+                    }));
+                } catch (_e) { /* tabla firmantes_documento aún no creada */ }
+            }
         } catch (_e) { /* tabla aún no creada */ }
 
         const idsCubiertos = new Set(actasFormales.flatMap(a => a.ids));

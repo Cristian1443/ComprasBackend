@@ -249,7 +249,7 @@ export function generarPdfActaComite({ solicitudes, actaNumero, fechaSesion, par
             doc.font('Helvetica').fontSize(11).text('En constancia firman:');
             doc.moveDown(1.2);
 
-            if (doc.y > doc.page.height - 160) doc.addPage();
+            if (doc.y > doc.page.height - 260) doc.addPage();
             bloqueFirmaComite(doc, firmantes || []);
 
             const rango = doc.bufferedPageRange();
@@ -561,27 +561,27 @@ function bloqueFirmaComite(doc, firmantes) {
     const directora = firmantes[0] || { nombre: '___________________________', cargo: 'Directora de Comité' };
     const secretaria = firmantes[1] || { nombre: '___________________________', cargo: 'Secretaria de Comité' };
 
-    const y = doc.y;
-    // Columna izq (Directora) — el tag {{Sig_es_:signerN:signature}} lo reemplaza
-    // Adobe Sign por el campo de firma real; el texto no queda visible en el PDF final.
-    doc.fontSize(11).fillColor('#000000').font('Helvetica')
-        .text('{{Sig_es_:signer1:signature}}', 60, y, { width: 200 });
-    doc.moveTo(60, y + 52).lineTo(260, y + 52).strokeColor('#1f2937').lineWidth(1.5).stroke();
-    doc.fillColor('#000000').fontSize(11).font('Helvetica-Bold')
-        .text(directora.nombre, 60, y + 57, { width: 200 });
-    doc.fontSize(11).fillColor('#000000').font('Helvetica')
-        .text(directora.cargo, 60, y + 73, { width: 200 });
+    // Firmas apiladas (antes iban lado a lado en columnas de 200pt): con ese
+    // ancho no cabía un tag de fuente grande sin encimarse con el de al lado,
+    // así que Adobe Sign dimensionaba un campo de firma diminuto. Misma fuente
+    // (24pt) y espaciado que ya funciona en generarPdfEvaluacionProveedor.
+    let y = doc.y;
+    [
+        { firmante: directora, tag: 'signer1' },
+        { firmante: secretaria, tag: 'signer2' },
+    ].forEach(({ firmante, tag }) => {
+        doc.fontSize(24).fillColor('#000000').font('Helvetica').text(`{{Sig_es_:${tag}:signature}}`, 60, y);
+        doc.moveTo(60, y + 60).lineTo(400, y + 60).strokeColor(COLOR_GRIS).lineWidth(1).stroke();
+        doc.fontSize(9).fillColor(COLOR_GRIS_CLARO).font('Helvetica')
+            .text('Firma electrónica', 60, y + 66, { width: 340 });
+        doc.fillColor(COLOR_GRIS).fontSize(10).font('Helvetica-Bold')
+            .text(firmante.nombre, 60, y + 79, { width: 340 });
+        doc.fontSize(9).fillColor(COLOR_GRIS_CLARO).font('Helvetica')
+            .text(firmante.cargo, 60, y + 93, { width: 340 });
+        y += 118;
+    });
 
-    // Columna der (Secretaria)
-    doc.fontSize(11).fillColor('#000000').font('Helvetica')
-        .text('{{Sig_es_:signer2:signature}}', 310, y, { width: 200 });
-    doc.moveTo(310, y + 52).lineTo(510, y + 52).strokeColor('#1f2937').lineWidth(1.5).stroke();
-    doc.fillColor('#000000').fontSize(11).font('Helvetica-Bold')
-        .text(secretaria.nombre, 310, y + 57, { width: 200 });
-    doc.fontSize(11).fillColor('#000000').font('Helvetica')
-        .text(secretaria.cargo, 310, y + 73, { width: 200 });
-
-    doc.y = y + 95;
+    doc.y = y;
 }
 
 /** Dibuja el membrete institucional (logo IIB arriba a la derecha) en la página actual. */

@@ -1945,6 +1945,39 @@ app.get('/api/secretaria/metrics', async (_req, res) => {
     }
 });
 
+// El consecutivo de acta se calcula aquí (a partir de actas_comite), no en el
+// navegador de cada persona — antes vivía en localStorage por usuario, así que
+// cada secretaria/administrador que podía iniciar comité veía su propio conteo
+// y distintas personas podían terminar generando el mismo número.
+async function calcularSiguienteNumeroActa(año) {
+    const r = await pool.query(
+        `SELECT acta_numero FROM actas_comite WHERE acta_numero LIKE $1`,
+        [`${año}-%`]
+    );
+    let maxConsecutivo = 0;
+    for (const row of r.rows) {
+        const match = /^(\d+)-(\d+)$/.exec(String(row.acta_numero || ''));
+        if (match && Number(match[1]) === año) {
+            maxConsecutivo = Math.max(maxConsecutivo, parseInt(match[2], 10) || 0);
+        }
+    }
+    return `${año}-${String(maxConsecutivo + 1).padStart(3, '0')}`;
+}
+
+// GET /api/secretaria/actas/siguiente-numero
+// Sugerencia de número de acta consistente para cualquier usuario que pueda
+// iniciar un comité, sin importar el navegador o dispositivo desde el que entre.
+app.get('/api/secretaria/actas/siguiente-numero', async (req, res) => {
+    try {
+        const año = parseInt(req.query.año, 10) || new Date().getFullYear();
+        const acta_numero = await calcularSiguienteNumeroActa(año);
+        return res.json({ acta_numero });
+    } catch (err) {
+        console.error('Error calculando siguiente número de acta:', err);
+        return res.status(500).json({ error: 'Error al calcular el siguiente número de acta' });
+    }
+});
+
 // ─── RUTA: Historial de actas de comité ──────────────────────────
 // GET /api/secretaria/actas/historial
 // Devuelve actas formales guardadas + sesiones reconstruidas desde solicitudes.
@@ -2035,20 +2068,34 @@ app.get('/api/secretaria/actas/historial', async (_req, res) => {
 // POST /api/secretaria/actas
 app.post('/api/secretaria/actas', async (req, res) => {
     try {
-        const { acta_numero, fecha_sesion, participantes, solicitudes_ids, decisiones } = req.body;
+        const { fecha_sesion, participantes, solicitudes_ids, decisiones } = req.body;
+        let acta_numero = String(req.body.acta_numero || '').trim();
+        const año = new Date(fecha_sesion || new Date()).getFullYear();
+
+        if (!acta_numero) {
+            acta_numero = await calcularSiguienteNumeroActa(año);
+        } else {
+            const existe = await pool.query('SELECT 1 FROM actas_comite WHERE acta_numero = $1', [acta_numero]);
+            if (existe.rows.length > 0) {
+                return res.status(409).json({
+                    error: `El número de acta "${acta_numero}" ya fue usado por otra sesión. Actualiza la página para obtener el siguiente número disponible.`
+                });
+            }
+        }
+
         const result = await pool.query(
             `INSERT INTO actas_comite (acta_numero, fecha_sesion, participantes, solicitudes_ids, decisiones)
              VALUES ($1, $2, $3::jsonb, $4, $5::jsonb)
              RETURNING id::text`,
             [
-                acta_numero || null,
+                acta_numero,
                 fecha_sesion || new Date().toISOString(),
                 JSON.stringify(participantes || []),
                 solicitudes_ids || [],
                 JSON.stringify(decisiones || {}),
             ]
         );
-        return res.json({ ok: true, id: result.rows[0].id });
+        return res.json({ ok: true, id: result.rows[0].id, acta_numero });
     } catch (err) {
         console.error('Error guardando acta:', err);
         return res.status(500).json({ error: 'Error al guardar acta' });

@@ -4725,6 +4725,49 @@ function sanitizeScreenPermissions(value) {
     );
 }
 
+// El rol real en `usuarios.rol` (no la lista de pantallas) es lo único que
+// verifica requireRole() en el backend. Sin esto, otorgar la pantalla
+// "Administrador" desde Gestión de Usuarios solo cambiaba lo que la persona
+// veía en el frontend, pero el backend seguía rechazando sus acciones de
+// administrador (403) porque su rol de base de datos nunca se actualizaba.
+// Mantiene la misma precedencia que ya usa el frontend para mostrar el
+// "rol efectivo" en la tabla de usuarios (GestionUsuarios.tsx).
+const SCREEN_TO_ROL_USUARIO = {
+    Administrador: 'administrador',
+    SecretariaComite: 'secretaria_comite',
+    Financiera: 'financiera',
+    Juridica: 'juridica',
+    Riesgos: 'riesgos',
+    Gerente: 'gerente_area',
+    Supervisor: 'supervisor',
+};
+const PRECEDENCIA_ROL_PANTALLAS = ['Administrador', 'SecretariaComite', 'Financiera', 'Juridica', 'Riesgos', 'Gerente', 'Supervisor'];
+
+function rolDesdePermisosPantallas(permisos, rolActual) {
+    const pantallaGanadora = PRECEDENCIA_ROL_PANTALLAS.find((p) => permisos.includes(p));
+    return pantallaGanadora ? SCREEN_TO_ROL_USUARIO[pantallaGanadora] : rolActual;
+}
+
+/** Actualiza usuarios.rol si cambió y registra el cambio en auditoría. Silencioso si el usuario no existe. */
+async function sincronizarRolConPermisos({ usuarioId, rolAnterior, permisosSanitizados, actor, ipAddress }) {
+    if (!usuarioId) return rolAnterior;
+    const rolNuevo = rolDesdePermisosPantallas(permisosSanitizados, rolAnterior);
+    if (rolNuevo === rolAnterior) return rolAnterior;
+
+    await pool.query('UPDATE usuarios SET rol = $1::rol_usuario, actualizado_en = NOW() WHERE id = $2', [rolNuevo, usuarioId]);
+    await registrarLog({
+        tipo_log: 'seguridad', modulo: 'administracion', tabla: 'usuarios',
+        registro_id: usuarioId, accion: 'UPDATE',
+        campo: 'rol',
+        valor_anterior: rolAnterior || null,
+        valor_nuevo: rolNuevo,
+        descripcion: `${actor} cambió el rol del sistema a "${rolNuevo}" al actualizar permisos de pantalla`,
+        usuario_id: usuarioId, rol_usuario: rolNuevo,
+        ip_address: ipAddress, resultado: 'exitoso'
+    });
+    return rolNuevo;
+}
+
 async function saveUserScreenPermissionsMap(map) {
     await pool.query(
         `INSERT INTO configuracion (clave, valor, descripcion, actualizado_en)
@@ -4826,10 +4869,22 @@ app.put('/api/admin/permisos-pantallas', requireRole('administrador'), async (re
             ip_address: getClientIp(req), resultado: 'exitoso'
         });
 
+        // Mantiene sincronizado el rol real (el que valida requireRole en el backend)
+        // con la pantalla otorgada — de lo contrario, marcar "Administrador" aquí solo
+        // cambia lo que la persona ve, no lo que el backend le permite ejecutar.
+        const rolActualizado = await sincronizarRolConPermisos({
+            usuarioId: destinatario?.id || null,
+            rolAnterior: destinatario?.rol || null,
+            permisosSanitizados,
+            actor: req.auth.email,
+            ipAddress: getClientIp(req),
+        });
+
         return res.json({
             ok: true,
             email: emailKey,
-            permisos: permisosSanitizados
+            permisos: permisosSanitizados,
+            rol: rolActualizado
         });
     } catch (err) {
         console.error(err);
@@ -4844,7 +4899,7 @@ app.put('/api/admin/usuarios/:id/permisos-pantallas', requireRole('administrador
 
     try {
         const userRes = await pool.query(
-            'SELECT id, email, nombre FROM usuarios WHERE id = $1::uuid',
+            'SELECT id, email, nombre, rol FROM usuarios WHERE id = $1::uuid',
             [id]
         );
 
@@ -4872,12 +4927,24 @@ app.put('/api/admin/usuarios/:id/permisos-pantallas', requireRole('administrador
             ip_address: getClientIp(req), resultado: 'exitoso'
         });
 
+        // Ver nota en PUT /api/admin/permisos-pantallas: sin esto, el rol real
+        // (usuarios.rol) nunca reflejaba la pantalla otorgada y requireRole()
+        // seguía rechazando al usuario en el backend.
+        const rolActualizado = await sincronizarRolConPermisos({
+            usuarioId: user.id,
+            rolAnterior: user.rol,
+            permisosSanitizados,
+            actor: req.auth.email,
+            ipAddress: getClientIp(req),
+        });
+
         return res.json({
             ok: true,
             usuario_id: user.id,
             email: user.email,
             nombre: user.nombre,
-            permisos: permisosSanitizados
+            permisos: permisosSanitizados,
+            rol: rolActualizado
         });
     } catch (err) {
         console.error(err);

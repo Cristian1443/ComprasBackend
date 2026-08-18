@@ -17,6 +17,8 @@ import nodemailer from 'nodemailer';
 import { registrarRutasFirmas } from './routes/firmas.js';
 import { crearMiddlewareAuth } from './middleware/auth.js';
 import { iniciarArchivadoAuditoria } from './jobs/archivarAuditoria.js';
+import { generarPdfFormatoPlaneacion, generarPdfValidacionPresupuestal, generarPdfFichaComite } from './services/pdfGenerator.js';
+import { subirArchivoContrato } from './services/graphAppService.js';
 
 dotenv.config();
 
@@ -2249,6 +2251,174 @@ app.post('/api/solicitudes/:id/comite', async (req, res) => {
     }
 });
 
+// Ensambla la solicitud con todos los campos que necesitan los generadores de
+// PDF (formato de planeación, validación presupuestal, ficha de comité):
+// resumen (nombres de gerente/financiera/jurídica/supervisor), fila completa
+// de `solicitudes`, modalidad_seleccion/justificacion_cd (viven aparte, en
+// solicitudes_modalidad_directa) y proponentes.
+async function obtenerSolicitudParaDocumentos(solicitudId) {
+    const resumenRes = await pool.query(`SELECT * FROM v_solicitudes_resumen WHERE id = $1`, [solicitudId]);
+    if (resumenRes.rows.length === 0) return null;
+    const solicitud = resumenRes.rows[0];
+
+    const fullRes = await pool.query(`SELECT * FROM solicitudes WHERE id = $1`, [solicitudId]);
+    if (fullRes.rows.length > 0) Object.assign(solicitud, fullRes.rows[0]);
+
+    const modalidadRes = await pool.query(`SELECT modalidad_seleccion, justificacion_cd FROM solicitudes_modalidad_directa WHERE solicitud_id = $1`, [solicitudId]);
+    if (modalidadRes.rows.length > 0) {
+        solicitud.modalidad_seleccion = modalidadRes.rows[0].modalidad_seleccion;
+        solicitud.justificacion_cd = modalidadRes.rows[0].justificacion_cd;
+    }
+
+    const proponentesRes = await pool.query(`SELECT * FROM proponentes WHERE solicitud_id = $1 ORDER BY numero ASC`, [solicitudId]);
+    solicitud.proponentes = proponentesRes.rows;
+
+    return solicitud;
+}
+
+// Ruta local (firmado si existe, si no el original) del PDF del Acta de
+// Comité que decidió sobre esta solicitud, o null si no hay acta registrada.
+async function obtenerRutaActaComite(solicitudId) {
+    try {
+        const { rows } = await pool.query(
+            `SELECT fd.pdf_firmado_path, fd.pdf_original_path
+             FROM actas_comite ac
+             JOIN firmas_documento fd ON fd.id = ac.firma_id
+             WHERE $1::text = ANY(ac.solicitudes_ids)
+             ORDER BY ac.fecha_sesion DESC LIMIT 1`,
+            [solicitudId]
+        );
+        if (rows.length === 0) return null;
+        return rows[0].pdf_firmado_path || rows[0].pdf_original_path || null;
+    } catch (e) {
+        console.error('Error buscando acta de comité para SharePoint:', e.message);
+        return null;
+    }
+}
+
+// Documentos que el proveedor ganador adjuntó durante la convocatoria
+// (cámara de comercio, RUT, propuesta, etc.). Para modalidad Directa, donde
+// no hay convocatoria formal, no existen y se devuelve [] sin error.
+async function obtenerDocumentosProveedorGanador(solicitudId) {
+    try {
+        const evalRes = await pool.query(
+            `SELECT evaluacion_json->>'ganador_email' AS ganador_email
+             FROM solicitudes_detalle_juridico WHERE solicitud_id = $1 LIMIT 1`,
+            [solicitudId]
+        );
+        const ganadorEmail = evalRes.rows[0]?.ganador_email;
+        if (!ganadorEmail) return [];
+
+        const invRes = await pool.query(
+            `SELECT documentos_proveedor, respuesta_archivos
+             FROM convocatoria_invitaciones
+             WHERE solicitud_id = $1 AND LOWER(proponente_email) = LOWER($2) LIMIT 1`,
+            [solicitudId, ganadorEmail]
+        );
+        if (invRes.rows.length === 0) return [];
+
+        const { documentos_proveedor, respuesta_archivos } = invRes.rows[0];
+        const archivos = [
+            ...(Array.isArray(documentos_proveedor) ? documentos_proveedor : []),
+            ...(Array.isArray(respuesta_archivos) ? respuesta_archivos : []),
+        ];
+        return archivos.filter((a) => a && (a.ruta || a.path || a.url));
+    } catch (e) {
+        console.error('Error buscando documentos del proveedor ganador:', e.message);
+        return [];
+    }
+}
+
+// Sube a la carpeta "01.Precontractual" de SharePoint los 5 documentos que
+// Jurídica requiere apenas aprueba una solicitud: Formato de planeación,
+// Validación presupuestal, Ficha (de comité), Acta de comité y Documentos
+// del proveedor ganador. Best-effort por documento: un fallo o una fuente
+// ausente (p.ej. Directa sin documentos de proveedor) no bloquea el resto
+// ni la respuesta de la aprobación jurídica.
+async function poblarCarpetaPrecontractual(solicitudId) {
+    const SUBCARPETA = '01.Precontractual';
+    const resultados = [];
+
+    try {
+        const solicitud = await obtenerSolicitudParaDocumentos(solicitudId);
+        if (!solicitud) {
+            console.error(`poblarCarpetaPrecontractual: solicitud ${solicitudId} no encontrada`);
+            return resultados;
+        }
+        const codigo = solicitud.codigo;
+        const tmpDir = path.join(__dirname, 'uploads', 'tmp-sharepoint');
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        const subirGenerado = async (nombreArchivo, generar) => {
+            const destino = path.join(tmpDir, `${solicitudId}-${nombreArchivo}`);
+            try {
+                await generar(destino);
+                await subirArchivoContrato({ pool, codigoContrato: codigo, subcarpeta: SUBCARPETA, nombreArchivo, filePath: destino });
+                resultados.push({ documento: nombreArchivo, ok: true });
+            } catch (e) {
+                console.error(`poblarCarpetaPrecontractual: error subiendo ${nombreArchivo}:`, e.message);
+                resultados.push({ documento: nombreArchivo, ok: false, error: e.message });
+            } finally {
+                fs.unlink(destino, () => {});
+            }
+        };
+
+        await subirGenerado('Formato de Planeación Contractual.pdf', (destino) =>
+            generarPdfFormatoPlaneacion(solicitud, 'juridica', destino)
+        );
+
+        if (solicitud.presupuesto_aprobado != null) {
+            await subirGenerado('Validación Presupuestal.pdf', (destino) =>
+                generarPdfValidacionPresupuestal({ solicitud, destinoPath: destino })
+            );
+        } else {
+            resultados.push({ documento: 'Validación Presupuestal.pdf', ok: false, error: 'Sin presupuesto aprobado registrado' });
+        }
+
+        await subirGenerado('Ficha de Comité.pdf', (destino) =>
+            generarPdfFichaComite({ solicitud, destinoPath: destino })
+        );
+
+        const rutaActa = await obtenerRutaActaComite(solicitudId);
+        if (rutaActa && fs.existsSync(rutaActa)) {
+            try {
+                await subirArchivoContrato({ pool, codigoContrato: codigo, subcarpeta: SUBCARPETA, nombreArchivo: 'Acta de Comité.pdf', filePath: rutaActa });
+                resultados.push({ documento: 'Acta de Comité.pdf', ok: true });
+            } catch (e) {
+                console.error('poblarCarpetaPrecontractual: error subiendo acta de comité:', e.message);
+                resultados.push({ documento: 'Acta de Comité.pdf', ok: false, error: e.message });
+            }
+        } else {
+            resultados.push({ documento: 'Acta de Comité.pdf', ok: false, error: 'Sin acta de comité registrada' });
+        }
+
+        const documentosProveedor = await obtenerDocumentosProveedorGanador(solicitudId);
+        for (const doc of documentosProveedor) {
+            const rutaLocal = doc.ruta || doc.path;
+            const nombreArchivo = doc.nombre || doc.nombre_original || path.basename(rutaLocal || doc.url || 'documento');
+            if (!rutaLocal || !fs.existsSync(rutaLocal)) continue;
+            try {
+                await subirArchivoContrato({
+                    pool, codigoContrato: codigo, subcarpeta: SUBCARPETA,
+                    nombreArchivo: `Proveedor - ${nombreArchivo}`, filePath: rutaLocal,
+                    contentType: doc.tipo || doc.contentType || 'application/octet-stream',
+                });
+                resultados.push({ documento: `Proveedor - ${nombreArchivo}`, ok: true });
+            } catch (e) {
+                console.error(`poblarCarpetaPrecontractual: error subiendo documento de proveedor ${nombreArchivo}:`, e.message);
+                resultados.push({ documento: `Proveedor - ${nombreArchivo}`, ok: false, error: e.message });
+            }
+        }
+        if (documentosProveedor.length === 0) {
+            resultados.push({ documento: 'Documentos del proveedor ganador', ok: false, error: 'Sin documentos registrados (esperado en modalidad Directa)' });
+        }
+    } catch (e) {
+        console.error('poblarCarpetaPrecontractual: error general:', e.message);
+    }
+
+    return resultados;
+}
+
 // POST /api/solicitudes/:id/juridica
 app.post('/api/solicitudes/:id/juridica', async (req, res) => {
     const { id } = req.params;
@@ -2321,6 +2491,12 @@ app.post('/api/solicitudes/:id/juridica', async (req, res) => {
             usuario_id: uJur?.id || null, rol_usuario: uJur?.rol || 'juridica',
             ip_address: getClientIp(req), resultado: 'exitoso'
         });
+
+        if (resultado === 'aprobado') {
+            poblarCarpetaPrecontractual(solJur.id).then((resultados) => {
+                console.log(`Carpeta 01.Precontractual (${solJur.codigo}):`, resultados);
+            });
+        }
 
         return res.json(solJur);
     } catch (err) {

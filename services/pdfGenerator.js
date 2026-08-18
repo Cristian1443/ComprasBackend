@@ -372,6 +372,188 @@ export function generarPdfActaDesignacionSupervisor({ solicitud, proveedor, dire
     });
 }
 
+// Mismo mapeo que compras-contratacion-frontend/src/lib/garantias.ts — el campo
+// `solicitudes.garantias` guarda las claves seleccionadas como encabezado
+// "[GARANTIAS:clave1,clave2]" seguido de texto libre.
+const AMPAROS_GARANTIA_LABELS = {
+    pago_anticipado: 'Pago anticipado',
+    cumplimiento: 'Cumplimiento del contrato',
+    calidad: 'Calidad del bien o del servicio',
+    salarios: 'Pago de salarios y prestaciones sociales',
+    estabilidad_obra: 'Estabilidad de la obra',
+    rc_extracontractual: 'Responsabilidad civil extracontractual y daños a terceros',
+};
+
+function formatearGarantiasTexto(valor) {
+    const texto = String(valor || '');
+    const prefijo = '[GARANTIAS:';
+    if (!texto.startsWith(prefijo)) return texto.trim();
+    const fin = texto.indexOf(']');
+    if (fin === -1) return texto.trim();
+    const claves = texto.slice(prefijo.length, fin).split(',').map((s) => s.trim()).filter(Boolean);
+    const detalles = texto.slice(fin + 1).replace(/^\n/, '').trim();
+    const etiquetas = claves.map((k) => AMPAROS_GARANTIA_LABELS[k]).filter(Boolean);
+    if (etiquetas.length === 0) return detalles;
+    return detalles ? `${etiquetas.join(', ')}. ${detalles}` : etiquetas.join(', ');
+}
+
+/**
+ * Genera el PDF "Validación Presupuestal" — certifica el rubro y presupuesto
+ * aprobado por Financiera para el contrato, con los mismos datos que ya se
+ * capturan en `solicitudes` (rubro, presupuesto_aprobado, moneda).
+ * @param {object} opts
+ * @param {object} opts.solicitud
+ * @param {string} opts.destinoPath
+ */
+export function generarPdfValidacionPresupuestal({ solicitud, destinoPath }) {
+    return new Promise((resolve, reject) => {
+        try {
+            fs.mkdirSync(path.dirname(destinoPath), { recursive: true });
+            const doc = new PDFDocument({ size: 'A4', margin: 40, info: {
+                Title: `Validación Presupuestal - ${solicitud.codigo}`,
+                Author: 'Invest in Bogotá',
+            }});
+            const stream = fs.createWriteStream(destinoPath);
+            doc.pipe(stream);
+
+            dibujarEncabezadoActa(doc);
+            doc.y = 110;
+
+            doc.fillColor('#000000').fontSize(14).font('Helvetica-Bold')
+                .text('VALIDACIÓN PRESUPUESTAL', { align: 'center' });
+            doc.moveDown(1);
+
+            doc.fontSize(11).font('Helvetica')
+                .text('El área Financiera certifica la disponibilidad y aprobación del presupuesto para la siguiente contratación:', { align: 'justify' });
+            doc.moveDown(0.6);
+
+            const X = 40, ANCHO = 515;
+            let y = doc.y;
+            const filas = [
+                ['NÚMERO DE CONTRATO', solicitud.codigo || '—'],
+                ['OBJETO', solicitud.titulo_contrato || solicitud.objeto || '—'],
+                ['RUBRO PRESUPUESTAL', solicitud.rubro || solicitud.rubro_presupuestal || '—'],
+                ['PRESUPUESTO APROBADO', montoActaTexto(solicitud)],
+                ['APROBADO POR', solicitud.financiera_nombre || '—'],
+                ['FECHA DE APROBACIÓN', formatearFecha(solicitud.fecha_respuesta_financiera)],
+            ];
+            filas.forEach(([label, value]) => {
+                y = filaTabla(doc, {
+                    x: X, y, labelW: 190, valueW: ANCHO - 190,
+                    label, value,
+                    labelBg: COLOR_NARANJA, labelColor: '#fff', valueColor: COLOR_GRIS,
+                });
+            });
+            doc.y = y + 14;
+
+            if (String(solicitud.comentario_financiera || '').trim()) {
+                doc.fontSize(10).font('Helvetica-Bold').fillColor(COLOR_GRIS).text('Observaciones de Financiera:');
+                doc.moveDown(0.2);
+                parrafo(doc, solicitud.comentario_financiera);
+            }
+
+            doc.fontSize(8).fillColor(COLOR_GRIS_CLARO)
+                .text(`Generado el ${formatearFechaHora(new Date())}`,
+                    40, doc.page.height - 22, { lineBreak: false });
+
+            doc.end();
+            stream.on('finish', () => resolve(destinoPath));
+            stream.on('error', reject);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+/**
+ * Genera el PDF "Ficha de Comité de Contratación" — réplica en pdfkit de la
+ * ficha que Secretaría imprime desde el navegador (FichaComite en
+ * DetalleSolicitudComite.tsx), para poder generarla también del lado del
+ * servidor y subirla automáticamente al repositorio del contrato.
+ * @param {object} opts
+ * @param {object} opts.solicitud
+ * @param {string} opts.destinoPath
+ */
+export function generarPdfFichaComite({ solicitud, destinoPath }) {
+    return new Promise((resolve, reject) => {
+        try {
+            const esDirecta = String(solicitud.modalidad || '').toLowerCase() === 'directa';
+            fs.mkdirSync(path.dirname(destinoPath), { recursive: true });
+            const doc = new PDFDocument({ size: 'A4', margin: 40, info: {
+                Title: `Ficha de Comité - ${solicitud.codigo}`,
+                Author: 'Invest in Bogotá',
+            }});
+            const stream = fs.createWriteStream(destinoPath);
+            doc.pipe(stream);
+
+            dibujarEncabezadoActa(doc);
+            doc.y = 110;
+
+            doc.fillColor('#000000').fontSize(14).font('Helvetica-Bold')
+                .text('FICHA DE COMITÉ DE CONTRATACIÓN', { align: 'center' });
+            doc.fontSize(10).font('Helvetica').fillColor(COLOR_GRIS_CLARO)
+                .text(`${solicitud.codigo || '—'} · ${esDirecta ? 'Contratación directa' : 'Proceso competitivo'}`, { align: 'center' });
+            doc.moveDown(1);
+
+            doc.fillColor(COLOR_GRIS).fontSize(11).font('Helvetica-Bold')
+                .text(solicitud.titulo_contrato || solicitud.objeto || 'Sin especificar');
+            doc.moveDown(0.6);
+
+            doc.font('Helvetica-Bold').fontSize(10).text('Contexto y descripción de la necesidad:');
+            parrafo(doc, solicitud.justificacion || solicitud.descripcion_necesidad_detalle || 'No proporcionado.');
+            doc.moveDown(0.4);
+
+            if (esDirecta) {
+                doc.font('Helvetica-Bold').fontSize(10).text('Sustentación de la causal:');
+                doc.moveDown(0.1);
+                filaBold(doc, 'Causal:', causalComiteTexto(solicitud) || 'No registrada');
+                const proveedor = Array.isArray(solicitud.proponentes) ? solicitud.proponentes[0] : null;
+                filaBold(doc, 'Proveedor propuesto:', proveedor?.nombre_proveedor || 'No proporcionado');
+            } else {
+                doc.font('Helvetica-Bold').fontSize(10).text('Estudio de mercado:');
+                doc.moveDown(0.2);
+                const proponentes = Array.isArray(solicitud.proponentes) ? solicitud.proponentes.slice(0, 3) : [];
+                if (proponentes.length > 0) {
+                    proponentes.forEach((p, i) => {
+                        const plazoP = plazoTexto({ plazo_ejecucion_meses: p.plazo_meses, plazo_ejecucion_dias: p.plazo_dias });
+                        filaBold(doc, `Proveedor ${i + 1}:`, `${p.nombre_proveedor || '—'} · ${p.valor_cotizacion ? formatNum(p.valor_cotizacion) : '—'} · ${plazoP}`);
+                    });
+                } else {
+                    doc.font('Helvetica').fontSize(10).fillColor(COLOR_GRIS_CLARO).text('Sin proponentes registrados.');
+                }
+                filaBold(doc, 'Valor de referencia mercado:', solicitud.analisis_presupuesto_oficial || solicitud.analisis_valor_promedio || 'No proporcionado');
+                filaBold(doc, 'Alternativa recomendada:', solicitud.analisis_servicios_ofertados || 'No proporcionado');
+            }
+            filaBold(doc, 'Concepto jurídico:', solicitud.concepto_juridico || 'No proporcionado');
+            filaBold(doc, 'Garantías:', formatearGarantiasTexto(solicitud.garantias) || 'No proporcionado');
+            if (solicitud.tiene_riesgos_juridicos === true && solicitud.riesgos_juridicos) {
+                filaBold(doc, 'Riesgos jurídicos:', solicitud.riesgos_juridicos);
+            }
+            doc.moveDown(0.6);
+
+            doc.font('Helvetica-Bold').fontSize(10).fillColor(COLOR_GRIS).text('Datos del contrato:');
+            doc.moveDown(0.2);
+            filaBold(doc, 'Monto total:', montoActaTexto(solicitud));
+            filaBold(doc, 'Plazo:', plazoTexto(solicitud));
+            filaBold(doc, 'Forma de pago:', solicitud.forma_pago || 'No especificado');
+            filaBold(doc, 'Origen de PPTO:', solicitud.gerencia_nombre || 'No especificado');
+            filaBold(doc, 'Supervisor del contrato:', solicitud.supervision_nombre || solicitud.solicitante_nombre || 'No especificado');
+            filaBold(doc, 'Rubro presupuestal:', solicitud.rubro || solicitud.rubro_presupuestal || 'No especificado');
+            if (solicitud.tiene_riesgos_juridicos === true && solicitud.riesgos) {
+                filaBold(doc, 'Riesgos principales:', solicitud.riesgos);
+            }
+
+            doc.fontSize(8).fillColor(COLOR_GRIS_CLARO)
+                .text('F38-MA-GAF-02 V01', 40, doc.page.height - 22, { lineBreak: false });
+
+            doc.end();
+            stream.on('finish', () => resolve(destinoPath));
+            stream.on('error', reject);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
 const COLOR_ROJO_RA15 = '#D0312D';
 const COLOR_AMBAR_RA15 = '#F5A623';
 

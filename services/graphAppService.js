@@ -120,7 +120,7 @@ async function asegurarCarpeta(token, driveId, parentPath, nombre) {
 }
 
 /**
- * Sube un PDF a la carpeta del contrato en SharePoint (crea las carpetas
+ * Sube un archivo a la carpeta del contrato en SharePoint (crea las carpetas
  * que falten) usando credenciales de aplicación. No depende de que el
  * usuario tenga sesión activa en el navegador.
  *
@@ -129,10 +129,11 @@ async function asegurarCarpeta(token, driveId, parentPath, nombre) {
  * @param {string} params.codigoContrato - Código de la solicitud (nombre de carpeta raíz)
  * @param {string} params.subcarpeta - p.ej. '03.Postcontractual'
  * @param {string} params.nombreArchivo
- * @param {string} params.filePath - Ruta absoluta local del PDF a subir
+ * @param {string} params.filePath - Ruta absoluta local del archivo a subir
+ * @param {string} [params.contentType] - Por defecto 'application/pdf' (documentos de proveedor pueden ser otro tipo)
  * @returns {Promise<{ok: boolean, modo: string, webUrl: string|null}>}
  */
-export async function subirArchivoContrato({ pool, codigoContrato, subcarpeta, nombreArchivo, filePath }) {
+export async function subirArchivoContrato({ pool, codigoContrato, subcarpeta, nombreArchivo, filePath, contentType = 'application/pdf' }) {
     const config = await obtenerConfig(pool);
 
     if (config.modo === 'mock') {
@@ -157,7 +158,7 @@ export async function subirArchivoContrato({ pool, codigoContrato, subcarpeta, n
         `${GRAPH_BASE}/drives/${drive.id}/root:/${rutaDestino}:/content`,
         buffer,
         {
-            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/pdf' },
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': contentType },
             maxBodyLength: Infinity,
             maxContentLength: Infinity,
         }

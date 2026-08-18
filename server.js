@@ -4225,7 +4225,7 @@ app.get('/api/juridica/contratos', async (req, res) => {
         }
         const result = await pool.query(`
             SELECT
-                s.id, s.codigo, s.objeto, s.estado, s.moneda,
+                s.id, s.codigo, s.titulo_contrato, s.objeto, s.estado, s.moneda,
                 s.valor_en_cop, s.valor_estimado,
                 s.valor_moneda_cop_texto, s.valor_moneda_usd_texto, s.valor_moneda_eur_texto,
                 s.plazo_ejecucion_meses, s.plazo_ejecucion_dias, s.modalidad,

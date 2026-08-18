@@ -3951,12 +3951,26 @@ app.post('/api/juridica/solicitudes/:id/documentos/upload', (req, res, next) => 
 // supervisor en particular, así que ya son visibles para quien quede asignado.
 app.patch('/api/juridica/solicitudes/:id/supervisor', async (req, res) => {
     const { id } = req.params;
-    const { supervision_id } = req.body || {};
-    if (!supervision_id) return res.status(400).json({ error: 'supervision_id es requerido' });
+    const { supervision_id, email, azure_id, nombre, cargo } = req.body || {};
+    if (!supervision_id && !email) {
+        return res.status(400).json({ error: 'supervision_id o email son requeridos' });
+    }
     try {
-        const nuevoRes = await pool.query(`SELECT id, nombre, email, cargo FROM usuarios WHERE id = $1`, [supervision_id]);
-        if (nuevoRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-        const nuevo = nuevoRes.rows[0];
+        let nuevo;
+        if (supervision_id) {
+            const nuevoRes = await pool.query(`SELECT id, nombre, email, cargo FROM usuarios WHERE id = $1`, [supervision_id]);
+            if (nuevoRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+            nuevo = nuevoRes.rows[0];
+        } else {
+            // El candidato viene del directorio de Azure AD (grupo de la organización) y
+            // puede no haber iniciado sesión nunca en el portal, así que todavía no tiene
+            // fila en `usuarios`. ensureUsuarioExists la crea (o la actualiza si ya existe
+            // por email) para poder usarla como supervision_id.
+            const emailNorm = String(email).trim().toLowerCase();
+            const nuevoId = await ensureUsuarioExists(azure_id || null, emailNorm, nombre || emailNorm, cargo || null);
+            const nuevoRes = await pool.query(`SELECT id, nombre, email, cargo FROM usuarios WHERE id = $1`, [nuevoId]);
+            nuevo = nuevoRes.rows[0];
+        }
 
         const solRes = await pool.query(
             `SELECT s.codigo, s.titulo_contrato, s.objeto, s.supervision_id AS anterior_id,
@@ -3968,10 +3982,10 @@ app.patch('/api/juridica/solicitudes/:id/supervisor', async (req, res) => {
         if (solRes.rows.length === 0) return res.status(404).json({ error: 'Contrato no encontrado' });
         const solicitud = solRes.rows[0];
         const esReasignacion = !!solicitud.anterior_id;
-        const sinCambio = solicitud.anterior_id === supervision_id;
+        const sinCambio = solicitud.anterior_id === nuevo.id;
 
         if (!sinCambio) {
-            await pool.query(`UPDATE solicitudes SET supervision_id = $1 WHERE id = $2::uuid`, [supervision_id, id]);
+            await pool.query(`UPDATE solicitudes SET supervision_id = $1 WHERE id = $2::uuid`, [nuevo.id, id]);
 
             await registrarLog({
                 tipo_log: 'negocio', modulo: 'contratos', tabla: 'solicitudes',

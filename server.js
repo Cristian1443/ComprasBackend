@@ -3943,16 +3943,86 @@ app.post('/api/juridica/solicitudes/:id/documentos/upload', (req, res, next) => 
 });
 
 // PATCH /api/juridica/solicitudes/:id/supervisor
+// Asigna o reasigna el supervisor de un contrato. Al reasignar NO se toca
+// supervision_aceptada ni se borran entregables_supervisor/informes_supervision_contrato
+// (eso solo lo hace POST /api/supervisor/contratos/:id/aceptar) — así el nuevo
+// supervisor hereda intacto todo lo que ya existe del contrato: entregables,
+// informes, documentos y facturas quedan ligados a solicitud_id, no a un
+// supervisor en particular, así que ya son visibles para quien quede asignado.
 app.patch('/api/juridica/solicitudes/:id/supervisor', async (req, res) => {
     const { id } = req.params;
     const { supervision_id } = req.body || {};
     if (!supervision_id) return res.status(400).json({ error: 'supervision_id es requerido' });
     try {
-        const check = await pool.query(`SELECT id FROM usuarios WHERE id = $1`, [supervision_id]);
-        if (check.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-        await pool.query(`UPDATE solicitudes SET supervision_id = $1 WHERE id = $2::uuid`, [supervision_id, id]);
-        const uRes = await pool.query(`SELECT nombre, email, cargo FROM usuarios WHERE id = $1`, [supervision_id]);
-        return res.json({ ok: true, supervisor: uRes.rows[0] });
+        const nuevoRes = await pool.query(`SELECT id, nombre, email, cargo FROM usuarios WHERE id = $1`, [supervision_id]);
+        if (nuevoRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+        const nuevo = nuevoRes.rows[0];
+
+        const solRes = await pool.query(
+            `SELECT s.codigo, s.titulo_contrato, s.objeto, s.supervision_id AS anterior_id,
+                    u.nombre AS anterior_nombre, u.email AS anterior_email
+             FROM solicitudes s LEFT JOIN usuarios u ON u.id = s.supervision_id
+             WHERE s.id = $1::uuid`,
+            [id]
+        );
+        if (solRes.rows.length === 0) return res.status(404).json({ error: 'Contrato no encontrado' });
+        const solicitud = solRes.rows[0];
+        const esReasignacion = !!solicitud.anterior_id;
+        const sinCambio = solicitud.anterior_id === supervision_id;
+
+        if (!sinCambio) {
+            await pool.query(`UPDATE solicitudes SET supervision_id = $1 WHERE id = $2::uuid`, [supervision_id, id]);
+
+            await registrarLog({
+                tipo_log: 'negocio', modulo: 'contratos', tabla: 'solicitudes',
+                registro_id: id, accion: 'UPDATE', campo: 'supervision_id',
+                valor_anterior: solicitud.anterior_nombre || null,
+                valor_nuevo: nuevo.nombre,
+                descripcion: `${req.auth?.email || 'sistema'} ${esReasignacion ? 'reasignó' : 'asignó'} el supervisor del contrato ${solicitud.codigo}` +
+                    (esReasignacion ? ` de "${solicitud.anterior_nombre}" a "${nuevo.nombre}"` : ` a "${nuevo.nombre}"`),
+                usuario_id: req.auth?.usuarioId || null, rol_usuario: req.auth?.rol || null,
+                ip_address: getClientIp(req), resultado: 'exitoso',
+            });
+
+            if (nuevo.email) {
+                try {
+                    const envio = await prepararEnvioCorreo();
+                    await envio.enviar({
+                        to: nuevo.email,
+                        subject: `Se te asignó la supervisión del contrato ${solicitud.codigo}`,
+                        html: `
+                            <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;color:#1a2332;border:1px solid #e8ecf0;border-radius:12px;overflow:hidden;">
+                                <div style="background:#1f4e79;padding:24px 32px;">
+                                    <p style="margin:0;font-size:22px;font-weight:900;color:#fff;">Invest in <span style="color:#E84922;">Bogotá</span></p>
+                                    <p style="margin:4px 0 0;font-size:11px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.1em;">Portal de Compras y Contratación</p>
+                                </div>
+                                <div style="padding:32px;">
+                                    <p style="margin:0 0 8px;font-size:15px;font-weight:700;">Hola ${nuevo.nombre},</p>
+                                    <p style="margin:0 0 24px;font-size:14px;color:#334155;line-height:1.6;">
+                                        Quedaste asignado(a) como <strong>supervisor(a)</strong> del contrato <strong>${solicitud.codigo}</strong>${esReasignacion ? `, en reemplazo de ${solicitud.anterior_nombre}` : ''}.
+                                        Los entregables, informes, documentos y facturas ya registrados del contrato quedan disponibles para ti tal como estaban.
+                                    </p>
+                                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:20px;">
+                                        <p style="margin:0;font-size:13px;font-weight:700;color:#64748b;text-transform:uppercase;">Contrato</p>
+                                        <p style="margin:4px 0 0;font-size:14px;color:#1a2332;font-weight:600;">${solicitud.titulo_contrato || solicitud.objeto || ''}</p>
+                                    </div>
+                                    <p style="margin:24px 0 0;font-size:13px;color:#64748b;">Ingresa al portal para revisar el detalle en Mis Contratos.</p>
+                                </div>
+                            </div>
+                        `,
+                    });
+                } catch (e) {
+                    console.error('No se pudo notificar por correo al nuevo supervisor:', e.message);
+                }
+            }
+        }
+
+        return res.json({
+            ok: true,
+            supervisor: nuevo,
+            supervisorAnterior: esReasignacion ? { nombre: solicitud.anterior_nombre, email: solicitud.anterior_email } : null,
+            reasignado: esReasignacion && !sinCambio,
+        });
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Error al actualizar supervisor' });

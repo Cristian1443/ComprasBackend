@@ -267,6 +267,102 @@ export function generarPdfActaComite({ solicitudes, actaNumero, fechaSesion, par
     });
 }
 
+/**
+ * Genera el PDF "Acta de Designación de Supervisor" — memo de la Directora
+ * Ejecutiva (u ordenador del gasto) notificando al supervisor designado de
+ * un contrato, con los datos del contrato y espacio de firma para ambos.
+ *
+ * @param {object} opts
+ * @param {object} opts.solicitud - Fila de v_solicitudes_resumen + solicitudes (codigo, titulo_contrato/objeto, valor, plazo, fecha_respuesta_juridica)
+ * @param {object} [opts.proveedor] - Proponente/contratista ganador ({ nombre_proveedor, datos_contacto })
+ * @param {{ nombre: string, cargo: string }} opts.directora - Firmante 1 (Directora Ejecutiva / ordenador del gasto)
+ * @param {{ nombre: string, cargo?: string }} opts.supervisor - Firmante 2 (supervisor designado)
+ * @param {string} opts.destinoPath
+ */
+export function generarPdfActaDesignacionSupervisor({ solicitud, proveedor, directora, supervisor, destinoPath }) {
+    return new Promise((resolve, reject) => {
+        try {
+            fs.mkdirSync(path.dirname(destinoPath), { recursive: true });
+            const doc = new PDFDocument({
+                size: 'A4', margin: 40, bufferPages: true, info: {
+                    Title: `Acta de Designación de Supervisor - ${solicitud.codigo}`,
+                    Author: 'Invest in Bogotá',
+                },
+            });
+            const stream = fs.createWriteStream(destinoPath);
+            doc.pipe(stream);
+
+            doc.on('pageAdded', () => { dibujarEncabezadoActa(doc); doc.y = 110; });
+            dibujarEncabezadoActa(doc);
+            doc.y = 110;
+
+            doc.fillColor('#000000').fontSize(14).font('Helvetica-Bold')
+                .text('ACTA DE DESIGNACIÓN DE SUPERVISOR', { align: 'center' });
+            doc.moveDown(1);
+
+            doc.fontSize(11).font('Helvetica-Bold').text('DE: ', { continued: true })
+                .font('Helvetica').text(`${directora.nombre}${directora.cargo ? ` / ${directora.cargo}` : ''}`);
+            doc.font('Helvetica-Bold').text('PARA: ', { continued: true })
+                .font('Helvetica').text(supervisor.nombre || '—');
+            doc.font('Helvetica-Bold').text('ASUNTO: ', { continued: true })
+                .font('Helvetica').text('Designación de Supervisor de Contrato.');
+            doc.moveDown(0.8);
+
+            doc.fontSize(11).font('Helvetica')
+                .text('En calidad de ordenador del gasto me permito comunicarle que ha sido designado como Supervisor del siguiente contrato u orden de compra:', { align: 'justify' });
+            doc.moveDown(0.6);
+
+            const X = 40, ANCHO = 515;
+            // El NIT del contratista no se captura hoy en el registro de proponentes de
+            // modalidad Directa (solo nombre y datos de contacto) — queda en blanco si
+            // no viene informado por otra vía.
+            let y = doc.y;
+            const filas = [
+                ['NÚMERO DE CONTRATO', solicitud.codigo || '—'],
+                ['CONTRATISTA', proveedor?.nombre_proveedor || '—'],
+                ['NIT', proveedor?.nit || proveedor?.cedula_nit || '—'],
+                ['OBJETO', solicitud.titulo_contrato || solicitud.objeto || '—'],
+                ['FECHA DE FIRMA', formatearFecha(solicitud.fecha_respuesta_juridica || new Date())],
+                ['VALOR', `Hasta ${montoActaTexto(solicitud)}, más el IVA que se cause`],
+                ['DURACIÓN DEL CONTRATO', plazoTexto(solicitud)],
+            ];
+            filas.forEach(([label, value]) => {
+                y = filaTabla(doc, {
+                    x: X, y, labelW: 170, valueW: ANCHO - 170,
+                    label, value,
+                    labelBg: COLOR_NARANJA, labelColor: '#fff', valueColor: COLOR_GRIS,
+                });
+            });
+            doc.y = y + 14;
+
+            doc.fontSize(11).font('Helvetica')
+                .text('Por medio de la presente, se le comunica que como Supervisor del contrato tiene la responsabilidad de garantizar el cumplimiento de las obligaciones pactadas con el proveedor/contratista, velar porque las actividades se ejecuten conforme a las cláusulas pactadas en el contrato. Entre sus funciones principales se encuentran la verificación de la calidad, oportunidad y cumplimiento de los entregables; la autorización de pagos únicamente cuando se haya constatado la ejecución satisfactoria de las obligaciones por medio de entregables; la elaboración de informes de seguimiento; y la notificación oportuna al contratista sobre cualquier irregularidad, incumplimiento o riesgo que pueda afectar la correcta ejecución del contrato.', { align: 'justify' });
+            doc.moveDown(0.8);
+
+            doc.text(`En constancia de lo anterior, se suscribe la presente acta de designación en Bogotá D.C. el ${formatearFecha(new Date())}, dejando claro que el Supervisor designado acepta las responsabilidades aquí descritas y se compromete a cumplirlas de conformidad con las disposiciones legales, contractuales y normativas aplicables.`, { align: 'justify' });
+            doc.moveDown(1.5);
+
+            if (doc.y > doc.page.height - 260) doc.addPage();
+            bloqueFirmaComite(doc, [
+                { nombre: directora.nombre, cargo: directora.cargo || 'Directora Ejecutiva' },
+                { nombre: supervisor.nombre, cargo: 'Supervisor' },
+            ]);
+
+            const rango = doc.bufferedPageRange();
+            for (let i = rango.start; i < rango.start + rango.count; i++) {
+                doc.switchToPage(i);
+                dibujarPieActa(doc, solicitud.codigo);
+            }
+
+            doc.end();
+            stream.on('finish', () => resolve(destinoPath));
+            stream.on('error', reject);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
 const COLOR_ROJO_RA15 = '#D0312D';
 const COLOR_AMBAR_RA15 = '#F5A623';
 
@@ -607,8 +703,12 @@ function dibujarPieActa(doc, actaNumero) {
         .text('Agencia de promoción de inversión y eventos', 130, y, { width: 340 });
     doc.fontSize(7.5).fillColor(COLOR_GRIS_CLARO).font('Helvetica')
         .text('Calle 67 # 8-32/44; piso 4; Bogotá, D.C.  ·  (+57) 317 7806158  ·  www.investinbogota.org', 130, y + 10, { width: 340 });
+    // lineBreak:false evita que pdfkit calcule la altura de esta línea para su
+    // chequeo de desborde de página — sin esto, un texto absoluto tan cerca del
+    // borde inferior (page.height - 22) disparaba un salto de página espurio
+    // en cada llamada, agregando páginas en blanco extra al final del acta.
     doc.fontSize(7).fillColor(COLOR_GRIS_CLARO)
-        .text(`F13-PR-GD-01. V02. · Acta ${actaNumero}`, 40, doc.page.height - 22);
+        .text(`F13-PR-GD-01. V02. · Acta ${actaNumero}`, 40, doc.page.height - 22, { lineBreak: false });
 }
 
 /** Lista numerada simple (1. 2. 3. ...). */

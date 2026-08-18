@@ -35,10 +35,11 @@ import {
     generarPdfFormatoPlaneacion,
     generarPdfActaComite,
     generarPdfEvaluacionProveedor,
+    generarPdfActaDesignacionSupervisor,
 } from '../services/pdfGenerator.js';
 import { subirArchivoContrato, obtenerEstadoConexion as obtenerEstadoConexionGraph } from '../services/graphAppService.js';
 
-const ETAPAS_VALIDAS = ['gerente', 'financiera', 'comite', 'juridica', 'proveedor'];
+const ETAPAS_VALIDAS = ['gerente', 'financiera', 'comite', 'juridica', 'proveedor', 'supervision'];
 /** Etapas que ya no usan Adobe Sign; la aprobación queda con estampa de tiempo. */
 const ETAPAS_SIN_FIRMA_ELECTRONICA = ['gerente', 'financiera', 'juridica'];
 const OAUTH_SCOPES = 'user_login:self+agreement_send:account+agreement_read:account+agreement_write:account';
@@ -223,6 +224,41 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                     });
                 }
             }
+        } else if (etapa === 'supervision') {
+            // Firman la Directora Ejecutiva (ordenador del gasto, configurada en Admin →
+            // Configuración de Firmas) y el supervisor designado de este contrato en particular.
+            const r = await pool.query(
+                `SELECT * FROM configuracion_firmantes WHERE rol_firma = 'directora_ejecutiva' AND activo = TRUE`
+            );
+            if (r.rows[0]) {
+                out.push({
+                    rol_firma: 'directora_ejecutiva',
+                    nombre: r.rows[0].nombre,
+                    email: r.rows[0].email,
+                    cargo: r.rows[0].cargo || 'Directora Ejecutiva',
+                    orden: 1,
+                });
+            }
+            if (solicitud.supervision_email) {
+                out.push({
+                    rol_firma: 'supervisor_designado',
+                    nombre: solicitud.supervision_nombre || solicitud.supervision_email,
+                    email: solicitud.supervision_email,
+                    cargo: 'Supervisor del Contrato',
+                    orden: 2,
+                });
+            } else if (solicitud.supervision_id) {
+                const rs = await pool.query(`SELECT nombre, email, cargo FROM usuarios WHERE id = $1`, [solicitud.supervision_id]);
+                if (rs.rows[0]) {
+                    out.push({
+                        rol_firma: 'supervisor_designado',
+                        nombre: rs.rows[0].nombre,
+                        email: rs.rows[0].email,
+                        cargo: rs.rows[0].cargo || 'Supervisor del Contrato',
+                        orden: 2,
+                    });
+                }
+            }
         }
         return out;
     }
@@ -235,6 +271,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             juridica: 'visto_bueno_juridica',
             comite: 'acta_comite',
             proveedor: 'evaluacion_proveedor',
+            supervision: 'acta_supervision',
         }[etapa] || 'formato_planeacion';
     }
 
@@ -299,10 +336,20 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             }
 
             if (firmantes.length === 0) {
-                const mensajeFirmante = etapa === 'proveedor'
+                const mensajeFirmante = etapa === 'proveedor' || etapa === 'supervision'
                     ? 'No se encontró el supervisor designado para este contrato. Asigna un supervisor antes de enviar a firma.'
                     : `No se encontraron firmantes para la etapa "${etapa}". Verifica la configuración.`;
                 return res.status(400).json({ error: mensajeFirmante });
+            }
+            if (etapa === 'supervision') {
+                if (!firmantes.some((f) => f.rol_firma === 'directora_ejecutiva')) {
+                    return res.status(400).json({
+                        error: 'Falta configurar el firmante "Directora Ejecutiva" en Admin → Configuración de Firmas antes de poder enviar esta acta.',
+                    });
+                }
+                if (!firmantes.some((f) => f.rol_firma === 'supervisor_designado')) {
+                    return res.status(400).json({ error: 'No se encontró el supervisor designado para este contrato. Asigna un supervisor antes de enviar a firma.' });
+                }
             }
 
             // Evaluación del proveedor (requerida para la etapa "proveedor")
@@ -323,6 +370,21 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
 
             if (etapa === 'proveedor') {
                 await generarPdfEvaluacionProveedor({ solicitud, evaluacion, destinoPath: pdfPath });
+            } else if (etapa === 'supervision') {
+                const propRes = await pool.query(
+                    `SELECT * FROM proponentes WHERE solicitud_id = $1 ORDER BY numero`,
+                    [id]
+                );
+                const proveedor = propRes.rows.find((p) => p.seleccionado) || propRes.rows[0] || null;
+                const directoraF = firmantes.find((f) => f.rol_firma === 'directora_ejecutiva');
+                const supervisorF = firmantes.find((f) => f.rol_firma === 'supervisor_designado');
+                await generarPdfActaDesignacionSupervisor({
+                    solicitud,
+                    proveedor,
+                    directora: { nombre: directoraF.nombre, cargo: directoraF.cargo },
+                    supervisor: { nombre: supervisorF.nombre },
+                    destinoPath: pdfPath,
+                });
             } else if (etapa === 'comite') {
                 const numActa = actaNumero || `Sesión ${formatearFechaCorta(new Date())}`;
                 const fechaActa = fechaSesion || new Date().toISOString();
@@ -357,6 +419,8 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                 ? `Acta Comité - ${solicitud.codigo}`
                 : etapa === 'proveedor'
                 ? `Evaluación de Proveedor - ${solicitud.codigo}`
+                : etapa === 'supervision'
+                ? `Acta de Designación de Supervisor - ${solicitud.codigo}`
                 : `Aprobación ${etapa} - ${solicitud.codigo}`;
 
             // Crear acuerdo en Adobe

@@ -368,6 +368,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
             const nombreArchivo = `${etapa}_${Date.now()}.pdf`;
             const pdfPath = path.join(carpetaSolicitud, nombreArchivo);
 
+            let esReasignacionSupervision = false;
             if (etapa === 'proveedor') {
                 await generarPdfEvaluacionProveedor({ solicitud, evaluacion, destinoPath: pdfPath });
             } else if (etapa === 'supervision') {
@@ -378,11 +379,28 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                 const proveedor = propRes.rows.find((p) => p.seleccionado) || propRes.rows[0] || null;
                 const directoraF = firmantes.find((f) => f.rol_firma === 'directora_ejecutiva');
                 const supervisorF = firmantes.find((f) => f.rol_firma === 'supervisor_designado');
+
+                // Si este contrato ya tuvo un acta de supervisión firmada antes, esta es
+                // una reasignación (nuevo supervisor en reemplazo de otro), no la
+                // designación inicial — cambia el título y el texto del acta.
+                const anteriorRes = await pool.query(
+                    `SELECT ftd.nombre
+                     FROM firmas_documento fd
+                     JOIN firmantes_documento ftd ON ftd.firma_id = fd.id AND ftd.rol_firma = 'supervisor_designado'
+                     WHERE fd.solicitud_id = $1 AND fd.etapa = 'supervision' AND fd.estado = 'firmado'
+                     ORDER BY fd.completado_en DESC LIMIT 1`,
+                    [id]
+                );
+                esReasignacionSupervision = anteriorRes.rows.length > 0;
+                const supervisorAnterior = anteriorRes.rows[0]?.nombre || null;
+
                 await generarPdfActaDesignacionSupervisor({
                     solicitud,
                     proveedor,
                     directora: { nombre: directoraF.nombre, cargo: directoraF.cargo },
                     supervisor: { nombre: supervisorF.nombre },
+                    esReasignacion: esReasignacionSupervision,
+                    supervisorAnterior,
                     destinoPath: pdfPath,
                 });
             } else if (etapa === 'comite') {
@@ -420,7 +438,7 @@ export function registrarRutasFirmas(app, pool, uploadsDir) {
                 : etapa === 'proveedor'
                 ? `Evaluación de Proveedor - ${solicitud.codigo}`
                 : etapa === 'supervision'
-                ? `Acta de Designación de Supervisor - ${solicitud.codigo}`
+                ? `Acta de ${esReasignacionSupervision ? 'Asignación' : 'Designación'} de Supervisor - ${solicitud.codigo}`
                 : `Aprobación ${etapa} - ${solicitud.codigo}`;
 
             // Crear acuerdo en Adobe

@@ -268,24 +268,30 @@ export function generarPdfActaComite({ solicitudes, actaNumero, fechaSesion, par
 }
 
 /**
- * Genera el PDF "Acta de Designación de Supervisor" — memo de la Directora
- * Ejecutiva (u ordenador del gasto) notificando al supervisor designado de
+ * Genera el PDF "Acta de Designación/Asignación de Supervisor" — memo de la
+ * Directora Ejecutiva (u ordenador del gasto) notificando al supervisor de
  * un contrato, con los datos del contrato y espacio de firma para ambos.
+ * Cubre dos casos con texto distinto: la designación inicial del supervisor
+ * de un contrato, o la asignación de un nuevo supervisor cuando se reemplaza
+ * al que ya estaba (esReasignacion=true).
  *
  * @param {object} opts
  * @param {object} opts.solicitud - Fila de v_solicitudes_resumen + solicitudes (codigo, titulo_contrato/objeto, valor, plazo, fecha_respuesta_juridica)
  * @param {object} [opts.proveedor] - Proponente/contratista ganador ({ nombre_proveedor, datos_contacto })
  * @param {{ nombre: string, cargo: string }} opts.directora - Firmante 1 (Directora Ejecutiva / ordenador del gasto)
- * @param {{ nombre: string, cargo?: string }} opts.supervisor - Firmante 2 (supervisor designado)
+ * @param {{ nombre: string, cargo?: string }} opts.supervisor - Firmante 2 (supervisor designado/asignado)
+ * @param {boolean} [opts.esReasignacion] - true si ya existía un supervisor anterior en este contrato
+ * @param {string} [opts.supervisorAnterior] - Nombre de quien tenía la supervisión antes (solo si esReasignacion)
  * @param {string} opts.destinoPath
  */
-export function generarPdfActaDesignacionSupervisor({ solicitud, proveedor, directora, supervisor, destinoPath }) {
+export function generarPdfActaDesignacionSupervisor({ solicitud, proveedor, directora, supervisor, esReasignacion, supervisorAnterior, destinoPath }) {
     return new Promise((resolve, reject) => {
         try {
+            const tituloActa = esReasignacion ? 'ACTA DE ASIGNACIÓN DE SUPERVISOR' : 'ACTA DE DESIGNACIÓN DE SUPERVISOR';
             fs.mkdirSync(path.dirname(destinoPath), { recursive: true });
             const doc = new PDFDocument({
                 size: 'A4', margin: 40, bufferPages: true, info: {
-                    Title: `Acta de Designación de Supervisor - ${solicitud.codigo}`,
+                    Title: `${tituloActa} - ${solicitud.codigo}`,
                     Author: 'Invest in Bogotá',
                 },
             });
@@ -297,7 +303,7 @@ export function generarPdfActaDesignacionSupervisor({ solicitud, proveedor, dire
             doc.y = 110;
 
             doc.fillColor('#000000').fontSize(14).font('Helvetica-Bold')
-                .text('ACTA DE DESIGNACIÓN DE SUPERVISOR', { align: 'center' });
+                .text(tituloActa, { align: 'center' });
             doc.moveDown(1);
 
             doc.fontSize(11).font('Helvetica-Bold').text('DE: ', { continued: true })
@@ -305,11 +311,14 @@ export function generarPdfActaDesignacionSupervisor({ solicitud, proveedor, dire
             doc.font('Helvetica-Bold').text('PARA: ', { continued: true })
                 .font('Helvetica').text(supervisor.nombre || '—');
             doc.font('Helvetica-Bold').text('ASUNTO: ', { continued: true })
-                .font('Helvetica').text('Designación de Supervisor de Contrato.');
+                .font('Helvetica').text(esReasignacion ? 'Asignación de Supervisor de Contrato.' : 'Designación de Supervisor de Contrato.');
             doc.moveDown(0.8);
 
+            const introTexto = esReasignacion
+                ? `En calidad de ordenador del gasto me permito comunicarle que ha sido asignado como nuevo Supervisor del siguiente contrato u orden de compra${supervisorAnterior ? `, en reemplazo de ${supervisorAnterior}` : ''}:`
+                : 'En calidad de ordenador del gasto me permito comunicarle que ha sido designado como Supervisor del siguiente contrato u orden de compra:';
             doc.fontSize(11).font('Helvetica')
-                .text('En calidad de ordenador del gasto me permito comunicarle que ha sido designado como Supervisor del siguiente contrato u orden de compra:', { align: 'justify' });
+                .text(introTexto, { align: 'justify' });
             doc.moveDown(0.6);
 
             const X = 40, ANCHO = 515;
@@ -339,7 +348,7 @@ export function generarPdfActaDesignacionSupervisor({ solicitud, proveedor, dire
                 .text('Por medio de la presente, se le comunica que como Supervisor del contrato tiene la responsabilidad de garantizar el cumplimiento de las obligaciones pactadas con el proveedor/contratista, velar porque las actividades se ejecuten conforme a las cláusulas pactadas en el contrato. Entre sus funciones principales se encuentran la verificación de la calidad, oportunidad y cumplimiento de los entregables; la autorización de pagos únicamente cuando se haya constatado la ejecución satisfactoria de las obligaciones por medio de entregables; la elaboración de informes de seguimiento; y la notificación oportuna al contratista sobre cualquier irregularidad, incumplimiento o riesgo que pueda afectar la correcta ejecución del contrato.', { align: 'justify' });
             doc.moveDown(0.8);
 
-            doc.text(`En constancia de lo anterior, se suscribe la presente acta de designación en Bogotá D.C. el ${formatearFecha(new Date())}, dejando claro que el Supervisor designado acepta las responsabilidades aquí descritas y se compromete a cumplirlas de conformidad con las disposiciones legales, contractuales y normativas aplicables.`, { align: 'justify' });
+            doc.text(`En constancia de lo anterior, se suscribe la presente acta de ${esReasignacion ? 'asignación' : 'designación'} en Bogotá D.C. el ${formatearFecha(new Date())}, dejando claro que el Supervisor ${esReasignacion ? 'asignado' : 'designado'} acepta las responsabilidades aquí descritas y se compromete a cumplirlas de conformidad con las disposiciones legales, contractuales y normativas aplicables.`, { align: 'justify' });
             doc.moveDown(1.5);
 
             if (doc.y > doc.page.height - 260) doc.addPage();

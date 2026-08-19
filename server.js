@@ -5386,6 +5386,27 @@ app.get('/api/admin/logs', requireRole('administrador'), async (req, res) => {
     }
 });
 
+// GET /api/configuracion/reglas-modalidad
+// Valores no sensibles de `configuracion` que necesita el formulario de
+// creación de solicitudes (cualquier rol autenticado) para decidir el
+// umbral Invitación/TDR — el Administrador los edita en Parámetros.
+app.get('/api/configuracion/reglas-modalidad', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT clave, valor FROM configuracion WHERE clave IN ('SMLV_2025', 'UMBRAL_TDR_SMLV')`
+        );
+        const config = {};
+        rows.forEach((r) => { config[r.clave] = r.valor; });
+        return res.json({
+            smlv: Number(config.SMLV_2025) || 1423500,
+            umbralTdrSmlv: Number(config.UMBRAL_TDR_SMLV) || 50,
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Error al obtener configuración de modalidad' });
+    }
+});
+
 // GET /api/admin/configuracion
 app.get('/api/admin/configuracion', requireRole('administrador'), async (req, res) => {
     try {

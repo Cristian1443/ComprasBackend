@@ -787,6 +787,21 @@ app.patch('/api/solicitudes/:id/estado', async (req, res) => {
 });
 
 
+// El frontend formatea los campos numéricos de moneda con separador de miles
+// ("2.500.000") apenas el usuario sale del campo (onBlur), y ese texto
+// formateado es lo que llega en el payload de proponentes (valorCotizacion,
+// valorImpuestos, valorAgregado). Postgres rechaza ese formato en una
+// columna numeric ("invalid input syntax for type numeric"), lo que hacía
+// fallar el guardado — siempre, porque Invitación/TDR exige 3 proponentes
+// con valor de cotización diligenciado, y Directa no.
+function limpiarNumeroFormateado(val) {
+    if (val === null || val === undefined || val === '') return null;
+    if (typeof val === 'number') return val;
+    const cleaned = String(val).replace(/[$\s.]/g, '').replace(',', '.');
+    const num = Number(cleaned);
+    return isNaN(num) ? null : num;
+}
+
 // ─── RUTA: Crear nueva solicitud ─────────────────────────────
 // POST /api/solicitudes
 app.post('/api/solicitudes', async (req, res) => {
@@ -907,12 +922,12 @@ app.post('/api/solicitudes', async (req, res) => {
                         p.requisitosTecnicos || p.requisitos_tecnicos || null,
                         p.experiencia || null,
                         p.criteriosHabilitantes || p.criterios_habilitantes || null,
-                        p.valorImpuestos ? Number(p.valorImpuestos) : null,
-                        (p.valorAgregado ?? p.valor_agregado ?? null),
+                        limpiarNumeroFormateado(p.valorImpuestos ?? p.valor_con_impuestos),
+                        limpiarNumeroFormateado(p.valorAgregado ?? p.valor_agregado),
                         p.moneda || moneda || 'COP',
                         p.observaciones || null,
                         p.correo || null,
-                        p.valorCotizacion || p.valor_cotizacion || null,
+                        limpiarNumeroFormateado(p.valorCotizacion ?? p.valor_cotizacion),
                         p.plazoMeses ? Number(p.plazoMeses) : (p.plazo_meses ? Number(p.plazo_meses) : null),
                         p.plazoDias ? Number(p.plazoDias) : (p.plazo_dias ? Number(p.plazo_dias) : null),
                     ]
@@ -1091,15 +1106,6 @@ app.put('/api/solicitudes/:id', async (req, res) => {
 
                 if (!nombreProveedor) continue;
 
-                const cleanNumber = (val) => {
-                    if (val === null || val === undefined || val === '') return null;
-                    if (typeof val === 'number') return val;
-                    // Eliminar símbolos de moneda, espacios y puntos de miles, convertir coma decimal en punto
-                    const cleaned = String(val).replace(/[$\s.]/g, '').replace(',', '.');
-                    const num = Number(cleaned);
-                    return isNaN(num) ? null : num;
-                };
-
                 await pool.query(
                     `INSERT INTO proponentes (
                         solicitud_id, numero, nombre_proveedor, datos_contacto,
@@ -1116,12 +1122,12 @@ app.put('/api/solicitudes/:id', async (req, res) => {
                         p.requisitosTecnicos || p.requisitos_tecnicos || null,
                         p.experiencia || null,
                         p.criteriosHabilitantes || p.criterios_habilitantes || null,
-                        cleanNumber(p.valorImpuestos || p.valor_con_impuestos),
-                        (p.valorAgregado ?? p.valor_agregado ?? null),
+                        limpiarNumeroFormateado(p.valorImpuestos ?? p.valor_con_impuestos),
+                        limpiarNumeroFormateado(p.valorAgregado ?? p.valor_agregado),
                         p.moneda || moneda || 'COP',
                         p.observaciones || null,
                         p.correo || null,
-                        p.valorCotizacion || p.valor_cotizacion || null,
+                        limpiarNumeroFormateado(p.valorCotizacion ?? p.valor_cotizacion),
                         p.plazoMeses ? Number(p.plazoMeses) : (p.plazo_meses ? Number(p.plazo_meses) : null),
                         p.plazoDias ? Number(p.plazoDias) : (p.plazo_dias ? Number(p.plazo_dias) : null),
                     ]
